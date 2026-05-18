@@ -1,16 +1,18 @@
 """Pytest fixtures for reyn-broker tests.
 
-Each test gets a fresh broker subprocess bound to an ephemeral port so
-tests are isolated from each other and from any locally running broker.
+Each test gets a fresh broker subprocess bound to an ephemeral port and
+a per-test state file so tests are isolated from each other and from
+any locally running broker.
 """
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -37,23 +39,63 @@ def _wait_for_port(port: int, timeout: float) -> None:
     raise RuntimeError(f"broker did not start listening on port {port} within {timeout}s")
 
 
-@pytest.fixture
-def broker_url() -> Iterator[str]:
-    """Spawn a fresh broker subprocess for a single test."""
-    port = _free_port()
+def _spawn_broker(port: int, state_file: Path) -> subprocess.Popen:
+    env = {**os.environ, "BROKER_STATE_FILE": str(state_file)}
     proc = subprocess.Popen(
         [sys.executable, str(_SERVER_PY), "--port", str(port), "--log-level", "WARNING"],
         cwd=str(_BROKER_DIR),
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _wait_for_port(port, _BOOT_TIMEOUT_S)
+    return proc
+
+
+def _stop_broker(proc: subprocess.Popen) -> None:
+    proc.terminate()
     try:
-        _wait_for_port(port, _BOOT_TIMEOUT_S)
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.fixture
+def broker_url(tmp_path: Path) -> Iterator[str]:
+    """Spawn a fresh broker subprocess with an isolated state file."""
+    port = _free_port()
+    state_file = tmp_path / "state.json"
+    proc = _spawn_broker(port, state_file)
+    try:
         yield f"http://127.0.0.1:{port}/mcp"
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _stop_broker(proc)
+
+
+@pytest.fixture
+def broker_restart(tmp_path: Path) -> Iterator[Callable[[], str]]:
+    """Yield a callable that starts a broker (kills the previous one) on the
+    same port and state file, so tests can simulate server restarts.
+
+    Usage:
+        def test_x(broker_restart):
+            url = broker_restart()      # boot 1
+            ... do stuff ...
+            url = broker_restart()      # boot 2 — state.json preserved
+    """
+    port = _free_port()
+    state_file = tmp_path / "state.json"
+    current: dict[str, subprocess.Popen] = {}
+
+    def restart() -> str:
+        if "proc" in current:
+            _stop_broker(current["proc"])
+        current["proc"] = _spawn_broker(port, state_file)
+        return f"http://127.0.0.1:{port}/mcp"
+
+    try:
+        yield restart
+    finally:
+        if "proc" in current:
+            _stop_broker(current["proc"])

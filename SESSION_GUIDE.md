@@ -40,7 +40,11 @@ working_dir = pwd  (絶対パス)
 その値で `register_session` を 1 回呼ぶ:
 
 ```
-register_session(session_id="<basename>", working_dir="<absolute_path>")
+register_session(
+    session_id="<basename>",
+    working_dir="<absolute_path>",
+    role="<短い役割説明>",   # optional, 例: "PR review", "e2e tests"
+)
 → {
     "status": "registered '<basename>' at <path>",
     "pending_messages": [ {"from": ..., "message": ...}, ... ]
@@ -51,6 +55,11 @@ register_session(session_id="<basename>", working_dir="<absolute_path>")
 メッセージはすべてここに入っており、登録と同時に drain される
 (broker 側からは消える)。漏らさず読み、必要なら順番に処理すること。
 
+`role` は optional で、未指定なら `null` 扱い。 指定しておくと
+`list_sessions` の結果に含まれるので、 他セッションが session_id の
+命名規約を知らなくても役割を見て routing 判断できる。 freeform 1 行で OK
+(例: "PR review", "e2e tests", "TUI fixes")。
+
 ---
 
 ## 2. 他セッションを探す
@@ -59,13 +68,13 @@ register_session(session_id="<basename>", working_dir="<absolute_path>")
 
 ```
 list_sessions()
-→ [{"session_id": "...", "working_dir": "..."}, ...]
+→ [{"session_id": "...", "working_dir": "...", "role": "..." | null}, ...]
 ```
 
-返ってきた一覧から、目的に合いそうな `session_id` を選ぶ。
-working_dir のディレクトリ名やプロジェクト構成から役割が推測できる場合は
-それを手がかりにする。一覧に該当が無ければ、その役割のセッションは
-今オフラインということ。
+返ってきた一覧から、目的に合いそうな `session_id` を選ぶ。判断順:
+1. `role` が指定されていればそれを最優先 (= 自己申告された役割)
+2. `role` が null なら working_dir / session_id 名から推測
+3. 一覧に該当が無ければ、その役割のセッションは今オフラインということ
 
 ---
 
@@ -134,11 +143,23 @@ unregister_session(session_id="<自分の session_id>")
 
 ---
 
+## 5.5. broker restart 時の振る舞い
+
+broker (v0.3.0+) は sessions メタデータ + pending キューを disk に永続化する。 結果:
+
+- broker process restart があっても登録は維持される (= `list_sessions` から消えない)
+- 自分宛 pending message も維持される
+- ただし **`mcp_session` ref は ephemeral** なので push 通知 (`notifications/message`) は復活直後だけ届かない期間がある。 docs 上「push は best-effort」 を維持
+- watcher (Monitor task) は broker 接続が一時切断 → 自動 retry → 復活するので透過。 fallback として手動 `receive_messages` も使える
+- 「broker restart した」 と user / 他 session から通知されても、 **再 `register_session` は不要** (= 必要なら自分の判断で role 更新したい時だけ呼ぶ)
+
+---
+
 ## 6. 利用可能なツール早見表
 
 | ツール | 引数 | 用途 |
 |---|---|---|
-| `register_session` | `session_id`, `working_dir` | 起動時に 1 回。戻り値の `pending_messages` を必ず処理 |
+| `register_session` | `session_id`, `working_dir`, `role` (optional) | 起動時に 1 回。戻り値の `pending_messages` を必ず処理 |
 | `list_sessions` | (なし) | 相手を探す |
 | `post_message` | `to`, `from_session`, `message` | 依頼/返信を送る (常にキュー) |
 | `receive_messages` | `session_id` | 自分の inbox を drain して取得 (ポーリング) |

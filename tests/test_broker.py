@@ -67,6 +67,43 @@ async def test_list_sessions_reflects_registrations(broker_url: str) -> None:
     assert isinstance(sessions, list)
     ids = {s["session_id"] for s in sessions}
     assert ids == {"alice", "bob"}
+    # role is optional, omitted = None
+    assert all(s["role"] is None for s in sessions)
+
+
+@pytest.mark.asyncio
+async def test_register_with_role_surfaces_in_list(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool(
+            "register_session",
+            {"session_id": "alice", "working_dir": "/tmp/a", "role": "PR review"},
+        )
+        async with _client(broker_url) as b:
+            await b.call_tool(
+                "register_session",
+                {"session_id": "bob", "working_dir": "/tmp/b", "role": "e2e tests"},
+            )
+            result = await b.call_tool("list_sessions", {})
+    sessions = {s["session_id"]: s for s in _payload(result)}
+    assert sessions["alice"]["role"] == "PR review"
+    assert sessions["bob"]["role"] == "e2e tests"
+
+
+@pytest.mark.asyncio
+async def test_re_register_can_update_role(broker_url: str) -> None:
+    async with _client(broker_url) as a1:
+        await a1.call_tool(
+            "register_session",
+            {"session_id": "alice", "working_dir": "/tmp/a", "role": "old role"},
+        )
+    async with _client(broker_url) as a2:
+        await a2.call_tool(
+            "register_session",
+            {"session_id": "alice", "working_dir": "/tmp/a", "role": "new role"},
+        )
+        result = await a2.call_tool("list_sessions", {})
+    [alice] = _payload(result)
+    assert alice["role"] == "new role"
 
 
 @pytest.mark.asyncio
@@ -160,3 +197,56 @@ async def test_re_register_replaces_session_entry(broker_url: str) -> None:
     alice_entries = [s for s in sessions if s["session_id"] == "alice"]
     assert len(alice_entries) == 1
     assert alice_entries[0]["working_dir"] == "/tmp/a2"
+
+
+@pytest.mark.asyncio
+async def test_state_persists_sessions_across_restart(broker_restart) -> None:
+    url = broker_restart()
+    async with _client(url) as c:
+        await c.call_tool(
+            "register_session",
+            {"session_id": "alice", "working_dir": "/tmp/a", "role": "PR review"},
+        )
+
+    url = broker_restart()  # simulate broker restart
+    async with _client(url) as c:
+        result = await c.call_tool("list_sessions", {})
+    sessions = _payload(result)
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "alice"
+    assert sessions[0]["working_dir"] == "/tmp/a"
+    assert sessions[0]["role"] == "PR review"
+
+
+@pytest.mark.asyncio
+async def test_state_persists_pending_messages_across_restart(broker_restart) -> None:
+    url = broker_restart()
+    async with _client(url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "msg1"}
+        )
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "msg2"}
+        )
+
+    url = broker_restart()  # restart — pending should survive
+    async with _client(url) as b:
+        result = await b.call_tool(
+            "register_session", {"session_id": "bob", "working_dir": "/tmp/b"}
+        )
+    backlog = _payload(result)["pending_messages"]
+    assert [m["message"] for m in backlog] == ["msg1", "msg2"]
+
+
+@pytest.mark.asyncio
+async def test_unregister_removal_persists_across_restart(broker_restart) -> None:
+    url = broker_restart()
+    async with _client(url) as c:
+        await c.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await c.call_tool("unregister_session", {"session_id": "alice"})
+
+    url = broker_restart()
+    async with _client(url) as c:
+        result = await c.call_tool("list_sessions", {})
+    assert _payload(result) == []

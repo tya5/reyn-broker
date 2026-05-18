@@ -10,10 +10,12 @@ via the MCP-standard ``notifications/message`` (logging) notification.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -26,19 +28,78 @@ logger = logging.getLogger("broker")
 class SessionEntry:
     session_id: str
     working_dir: str
-    mcp_session: ServerSession
+    mcp_session: ServerSession | None  # None for entries restored from disk
+    role: str | None = None
 
 
 sessions: dict[str, SessionEntry] = {}
 pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
 registry_lock = asyncio.Lock()
 
+_DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "reyn-broker" / "state.json"
+_STATE_PATH = Path(os.environ.get("BROKER_STATE_FILE", _DEFAULT_STATE_PATH))
+
 mcp = FastMCP("broker")
+
+
+def _save_state() -> None:
+    """Persist sessions metadata + pending queue atomically.
+
+    Called under ``registry_lock`` after each mutation. The ``mcp_session``
+    ref is intentionally not persisted — it is tied to a live connection
+    and is irrelevant for restored entries (push notifications are
+    best-effort and skipped for entries without a live session).
+    """
+    try:
+        _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "sessions": [
+                {
+                    "session_id": e.session_id,
+                    "working_dir": e.working_dir,
+                    "role": e.role,
+                }
+                for e in sessions.values()
+            ],
+            "pending": {k: v for k, v in pending.items() if v},
+        }
+        tmp = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.replace(_STATE_PATH)
+    except OSError as exc:
+        logger.warning("state persistence failed: %s", exc)
+
+
+def _load_state() -> None:
+    """Load persisted state at startup. Safe to call when no file exists."""
+    if not _STATE_PATH.exists():
+        return
+    try:
+        data = json.loads(_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("state load failed (%s); starting fresh", exc)
+        return
+    for entry in data.get("sessions", []):
+        sid = entry["session_id"]
+        sessions[sid] = SessionEntry(
+            session_id=sid,
+            working_dir=entry["working_dir"],
+            mcp_session=None,
+            role=entry.get("role"),
+        )
+    for sid, msgs in data.get("pending", {}).items():
+        pending[sid].extend(msgs)
+    logger.info(
+        "restored state: %d sessions, %d queued messages across %d inboxes",
+        len(sessions),
+        sum(len(v) for v in pending.values()),
+        len(pending),
+    )
 
 
 async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
     entry = sessions.get(target_id)
-    if entry is None:
+    if entry is None or entry.mcp_session is None:
         return False
     try:
         await entry.mcp_session.send_log_message(
@@ -57,11 +118,15 @@ async def register_session(
     session_id: str,
     working_dir: str,
     ctx: Context,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Register this Claude Code session with the broker.
 
     Call this once at session startup. Pass your directory name as
-    ``session_id`` and the absolute path as ``working_dir``.
+    ``session_id`` and the absolute path as ``working_dir``. Optionally
+    pass ``role`` as a short free-text description of what this session
+    does (e.g. ``"PR review"``, ``"e2e tests"``) so peers can find you
+    via ``list_sessions`` without guessing from naming conventions.
 
     Returns any messages that were queued while this session was offline.
     """
@@ -70,8 +135,10 @@ async def register_session(
             session_id=session_id,
             working_dir=working_dir,
             mcp_session=ctx.session,
+            role=role,
         )
         backlog = pending.pop(session_id, [])
+        _save_state()
 
     return {
         "status": f"registered '{session_id}' at {working_dir}",
@@ -84,17 +151,27 @@ async def unregister_session(session_id: str) -> str:
     """Unregister a session from the broker."""
     async with registry_lock:
         existed = sessions.pop(session_id, None)
+        if existed is not None:
+            _save_state()
     if existed is None:
         return f"'{session_id}' was not registered"
     return f"unregistered '{session_id}'"
 
 
 @mcp.tool()
-async def list_sessions() -> list[dict[str, str]]:
-    """List currently registered sessions."""
+async def list_sessions() -> list[dict[str, Any]]:
+    """List currently registered sessions.
+
+    Each entry contains ``session_id``, ``working_dir``, and ``role``
+    (``None`` if the session did not declare one).
+    """
     async with registry_lock:
         return [
-            {"session_id": e.session_id, "working_dir": e.working_dir}
+            {
+                "session_id": e.session_id,
+                "working_dir": e.working_dir,
+                "role": e.role,
+            }
             for e in sessions.values()
         ]
 
@@ -114,6 +191,7 @@ async def post_message(to: str, from_session: str, message: str) -> str:
     async with registry_lock:
         pending[to].append(payload)
         target_online = to in sessions
+        _save_state()
 
     if target_online:
         await _deliver(to, payload)
@@ -132,6 +210,8 @@ async def receive_messages(session_id: str) -> list[dict[str, Any]]:
     """
     async with registry_lock:
         msgs = pending.pop(session_id, [])
+        if msgs:
+            _save_state()
     return msgs
 
 
@@ -166,7 +246,13 @@ def main() -> None:
     )
     mcp.settings.host = args.host
     mcp.settings.port = args.port
-    logger.info("starting broker on %s:%s", mcp.settings.host, mcp.settings.port)
+    logger.info(
+        "starting broker on %s:%s (state file: %s)",
+        mcp.settings.host,
+        mcp.settings.port,
+        _STATE_PATH,
+    )
+    _load_state()
     mcp.run(transport="streamable-http")
 
 

@@ -19,8 +19,6 @@ by session id.
 
 Read these first.
 
-- **In-memory state.** Restarting the broker drops the registry and any queued
-  messages. Persistence is not implemented.
 - **No acknowledgement.** `post_message` returns once queued; it cannot tell
   you whether the recipient acted on the message.
 - **Push is best-effort.** The broker also fires `notifications/message`
@@ -31,6 +29,11 @@ Read these first.
   pass `--host`. There is no built-in token check.
 - **Tested only with Claude Code.** Other MCP clients should connect if they
   speak Streamable HTTP, but they are unverified.
+
+State (registered sessions, role, pending messages) is persisted to a JSON
+file (default `~/.local/state/reyn-broker/state.json`, override with
+`BROKER_STATE_FILE`) so the broker can be restarted without registered
+sessions needing to re-register or losing queued messages.
 
 ## Install
 
@@ -48,18 +51,22 @@ reyn-broker --host 0.0.0.0 --port 9000
 reyn-broker --log-level DEBUG
 ```
 
-Environment variables (`BROKER_HOST`, `BROKER_PORT`, `BROKER_LOG_LEVEL`) are
-honoured as defaults; CLI flags win.
+Environment variables (`BROKER_HOST`, `BROKER_PORT`, `BROKER_LOG_LEVEL`,
+`BROKER_STATE_FILE`) are honoured as defaults; CLI flags win where they exist.
 
 ## MCP tools
 
-| Tool                | Args                                  | Effect                                                                          |
-|---------------------|---------------------------------------|---------------------------------------------------------------------------------|
-| `register_session`  | `session_id`, `working_dir`           | Register this client. Returns `status` and `pending_messages` (drained backlog). |
-| `unregister_session`| `session_id`                          | Remove from the registry.                                                       |
-| `list_sessions`     | —                                     | Return all currently registered sessions.                                       |
-| `post_message`      | `to`, `from_session`, `message`       | Queue a message in the recipient's inbox.                                       |
-| `receive_messages`  | `session_id`                          | Drain and return the caller's inbox.                                            |
+| Tool                | Args                                            | Effect                                                                          |
+|---------------------|-------------------------------------------------|---------------------------------------------------------------------------------|
+| `register_session`  | `session_id`, `working_dir`, `role?` (optional) | Register this client. Returns `status` and `pending_messages` (drained backlog). |
+| `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
+| `list_sessions`     | —                                               | Return registered sessions (`session_id`, `working_dir`, `role`).               |
+| `post_message`      | `to`, `from_session`, `message`                 | Queue a message in the recipient's inbox.                                       |
+| `receive_messages`  | `session_id`                                    | Drain and return the caller's inbox.                                            |
+
+`role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so
+peers can find you via `list_sessions` without relying on naming conventions.
+It is optional; sessions that omit it appear with `role: null`.
 
 ## Client configuration
 
