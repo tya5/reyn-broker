@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local MCP config (per-host, not part of OSS distribution)
+.mcp.json
+
+# Internal team-only operating docs (kept locally, not part of OSS distribution)
+MAINTAINER_GUIDE.md
+SESSION_BOOTSTRAP.md

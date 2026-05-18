@@ -1,0 +1,58 @@
+[project]
+name = "reyn-broker"
+version = "0.1.0"
+description = "A small MCP broker that lets multiple Claude Code sessions exchange messages by session id."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    { name = "Tetsuya Yasuda", email = "tetsuyayasuda@gmail.com" },
+]
+keywords = ["mcp", "claude", "claude-code", "broker", "agent", "messaging"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp[cli]>=1.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+reyn-broker = "server:main"
+
+[project.urls]
+Homepage = "https://github.com/tya5/reyn-broker"
+Repository = "https://github.com/tya5/reyn-broker"
+Issues = "https://github.com/tya5/reyn-broker/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "session_watcher"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
