@@ -162,6 +162,7 @@ broker (v0.3.0+) は sessions メタデータ + pending キューを disk に永
 | `register_session` | `session_id`, `working_dir`, `role` (optional) | 起動時に 1 回。戻り値の `pending_messages` を必ず処理 |
 | `list_sessions` | (なし) | 相手を探す |
 | `post_message` | `to`, `from_session`, `message` | 依頼/返信を送る (常にキュー) |
+| `broadcast_message` | `from_session`, `message`, `exclude_self` (default true) | 全 registered session に同一 message を送る (= announce / anyone-help 用途) |
 | `receive_messages` | `session_id` | 自分の inbox を drain して取得 (ポーリング) |
 | `unregister_session` | `session_id` | 終了前に 1 回 |
 

@@ -62,6 +62,7 @@ Environment variables (`BROKER_HOST`, `BROKER_PORT`, `BROKER_LOG_LEVEL`,
 | `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
 | `list_sessions`     | —                                               | Return registered sessions (`session_id`, `working_dir`, `role`).               |
 | `post_message`      | `to`, `from_session`, `message`                 | Queue a message in the recipient's inbox.                                       |
+| `broadcast_message` | `from_session`, `message`, `exclude_self?`      | Queue the same message in every registered session's inbox (sender skipped by default). |
 | `receive_messages`  | `session_id`                                    | Drain and return the caller's inbox.                                            |
 
 `role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so

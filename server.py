@@ -200,6 +200,35 @@ async def post_message(to: str, from_session: str, message: str) -> str:
 
 
 @mcp.tool()
+async def broadcast_message(
+    from_session: str,
+    message: str,
+    exclude_self: bool = True,
+) -> str:
+    """Queue ``message`` in every registered session's inbox.
+
+    Same semantics as ``post_message`` but addressed to all registered
+    sessions at once. By default the sender's own inbox is skipped
+    (``exclude_self=True``). Use for announcements (broker restarts,
+    protocol changes) or "anyone available?" calls — the addressed-inbox
+    model is preserved (each recipient drains its own inbox via
+    ``receive_messages``).
+    """
+    payload = {"from": from_session, "message": message}
+
+    async with registry_lock:
+        targets = [sid for sid in sessions if not (exclude_self and sid == from_session)]
+        for sid in targets:
+            pending[sid].append(payload)
+        _save_state()
+
+    for sid in targets:
+        await _deliver(sid, payload)
+
+    return f"broadcast to {len(targets)} sessions"
+
+
+@mcp.tool()
 async def receive_messages(session_id: str) -> list[dict[str, Any]]:
     """Drain and return all queued messages addressed to ``session_id``.
 

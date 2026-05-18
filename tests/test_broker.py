@@ -240,6 +240,65 @@ async def test_state_persists_pending_messages_across_restart(broker_restart) ->
 
 
 @pytest.mark.asyncio
+async def test_broadcast_message_queues_to_all_others(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        async with _client(broker_url) as b:
+            await b.call_tool(
+                "register_session", {"session_id": "bob", "working_dir": "/tmp/b"}
+            )
+            async with _client(broker_url) as c:
+                await c.call_tool(
+                    "register_session", {"session_id": "carol", "working_dir": "/tmp/c"}
+                )
+                result = await a.call_tool(
+                    "broadcast_message",
+                    {"from_session": "alice", "message": "all hands"},
+                )
+                text = result.content[0].text
+                # alice excluded by default → 2 recipients
+                assert "broadcast to 2 sessions" in text
+
+                bob_inbox = _payload(
+                    await b.call_tool("receive_messages", {"session_id": "bob"})
+                )
+                carol_inbox = _payload(
+                    await c.call_tool("receive_messages", {"session_id": "carol"})
+                )
+                alice_inbox = _payload(
+                    await a.call_tool("receive_messages", {"session_id": "alice"})
+                )
+    assert bob_inbox == [{"from": "alice", "message": "all hands"}]
+    assert carol_inbox == [{"from": "alice", "message": "all hands"}]
+    assert alice_inbox == []  # sender excluded
+
+
+@pytest.mark.asyncio
+async def test_broadcast_message_include_self(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "broadcast_message",
+            {"from_session": "alice", "message": "self too", "exclude_self": False},
+        )
+        result = await a.call_tool("receive_messages", {"session_id": "alice"})
+    inbox = _payload(result)
+    assert inbox == [{"from": "alice", "message": "self too"}]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_message_no_recipients_when_alone(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        result = await a.call_tool(
+            "broadcast_message",
+            {"from_session": "alice", "message": "hello?"},
+        )
+    text = result.content[0].text
+    assert "broadcast to 0 sessions" in text
+
+
+@pytest.mark.asyncio
 async def test_unregister_removal_persists_across_restart(broker_restart) -> None:
     url = broker_restart()
     async with _client(url) as c:
