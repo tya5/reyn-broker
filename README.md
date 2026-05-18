@@ -54,6 +54,12 @@ reyn-broker --log-level DEBUG
 Environment variables (`BROKER_HOST`, `BROKER_PORT`, `BROKER_LOG_LEVEL`,
 `BROKER_STATE_FILE`) are honoured as defaults; CLI flags win where they exist.
 
+To stop: signal the broker process directly, e.g. `pkill -f reyn-broker` or
+`kill <pid>`. Avoid `lsof -ti:<port> | xargs kill` — that matches both the
+listening broker *and* any clients connected to that port (including the
+`session_watcher.py` polling processes), so it kills your watchers too.
+Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
+
 ## MCP tools
 
 | Tool                | Args                                            | Effect                                                                          |
