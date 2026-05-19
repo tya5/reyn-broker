@@ -252,8 +252,10 @@ N 行 stdout に書き出す。 Monitor は ~200ms 以内の stdout を 1 notifi
 message として parse** すること (= JSON 1 行 = 1 message が不変条件)。
 
 **長 message の truncation 対策 (0.5.0+)**: Monitor の event body サイズ上限
-(数 KB) を超えそうな message について、 watcher は full body を per-session
-journal file (`/tmp/reyn-broker-inbox/<session_id>/msg-<ts>-<sender>.json`)
+は実測で ~500 chars 程度 (0.5.0 で 1500 chars を default にしていたが、
+2026-05-19 観測で 529 chars message が truncate → 0.5.1 で **default 400 chars** に
+下方修正)。 threshold 超え message について、 watcher は full body を
+per-session journal file (`/tmp/reyn-broker-inbox/<session_id>/msg-<ts>-<sender>.json`)
 に書き出した上で、 emit する line を **summary 形式** に切替える:
 
 ```json

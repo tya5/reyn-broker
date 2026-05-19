@@ -113,9 +113,12 @@ watcher:
    `$BROKER_INBOX_JOURNAL_DIR/<session_id>/msg-<unix-ms>-<sender>.json`
    (default `/tmp/reyn-broker-inbox/...`).
 2. If the JSON-encoded message exceeds `BROKER_WATCHER_MAX_INLINE` chars
-   (default 1500), the emitted stdout line is a short summary with
+   (default 400), the emitted stdout line is a short summary with
    `_truncated: true` and `_full_path` pointing at the journal file —
-   recipients read that file to recover the full body.
+   recipients read that file to recover the full body. The default was
+   tuned empirically against Claude Code's Monitor cut-off, which sits
+   around 500 characters in practice; lower the limit further if you
+   observe multiple short messages batching past the cap.
 
 The journal files are not auto-cleaned. `/tmp` is typically wiped at
 reboot on most systems; delete manually if disk pressure is a concern.

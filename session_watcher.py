@@ -62,7 +62,7 @@ ERROR_BACKOFF_S = 10
 ERROR_QUIET_THRESHOLD = 5  # stay quiet for first N consecutive errors
 
 JOURNAL_BASE = Path(os.environ.get("BROKER_INBOX_JOURNAL_DIR", "/tmp/reyn-broker-inbox"))
-MAX_INLINE_BODY = int(os.environ.get("BROKER_WATCHER_MAX_INLINE", "1500"))
+MAX_INLINE_BODY = int(os.environ.get("BROKER_WATCHER_MAX_INLINE", "400"))
 
 _SAFE_SENDER_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
