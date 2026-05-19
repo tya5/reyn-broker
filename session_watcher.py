@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 BROKER_URL = "http://127.0.0.1:8765/mcp"
 POLL_S = 30
@@ -178,7 +178,7 @@ async def _poll_loop(session_id: str) -> None:
     while True:
         try:
             async with (
-                streamablehttp_client(BROKER_URL) as (read, write, _close),
+                streamable_http_client(BROKER_URL) as (read, write, _close),
                 ClientSession(read, write) as cs,
             ):
                 await cs.initialize()

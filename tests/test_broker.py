@@ -8,13 +8,13 @@ from typing import Any
 
 import pytest
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 @asynccontextmanager
 async def _client(url: str):
     async with (
-        streamablehttp_client(url) as (read, write, _close),
+        streamable_http_client(url) as (read, write, _close),
         ClientSession(read, write) as session,
     ):
         await session.initialize()

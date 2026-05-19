@@ -1,5 +1,9 @@
 # reyn-broker
 
+[![CI](https://github.com/tya5/reyn-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/tya5/reyn-broker/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
 A small MCP broker that lets multiple Claude Code sessions exchange messages
 by session id.
 
