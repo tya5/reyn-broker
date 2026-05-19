@@ -251,6 +251,29 @@ N 行 stdout に書き出す。 Monitor は ~200ms 以内の stdout を 1 notifi
 届くことがある。 受信側は **event body を行単位で split し、 各行を 1
 message として parse** すること (= JSON 1 行 = 1 message が不変条件)。
 
+**長 message の truncation 対策 (0.5.0+)**: Monitor の event body サイズ上限
+(数 KB) を超えそうな message について、 watcher は full body を per-session
+journal file (`/tmp/reyn-broker-inbox/<session_id>/msg-<ts>-<sender>.json`)
+に書き出した上で、 emit する line を **summary 形式** に切替える:
+
+```json
+{
+  "from": "<sender>",
+  "message": "[long message from <sender>, N chars — full text at /tmp/...]",
+  "_truncated": true,
+  "_full_path": "/tmp/reyn-broker-inbox/<self>/msg-<ts>-<sender>.json",
+  "_body_chars": N
+}
+```
+
+受信側の処理:
+1. event body 各行を JSON parse
+2. **`_truncated` field が true の場合**: `_full_path` を Read tool で開いて
+   原 JSON を取得 → 中の `"message"` field が本来の本文
+3. `_truncated` が無い / false なら従来通り `message` field をそのまま使う
+
+journal file は auto cleanup されない (= `/tmp` 配下なので再起動で消える)。
+
 ### 注意
 
 - **1 session につき watcher 1 つ**。 同じ session_id の watcher を複数起動

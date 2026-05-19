@@ -15,6 +15,14 @@ Output (per arrived message, one JSON line):
 
     {"from": "<sender>", "message": "<body>"}
 
+For messages whose JSON encoding exceeds ``MAX_INLINE_BODY`` characters,
+the watcher writes the full body to a per-session journal file and emits
+a *summary* line instead, with ``_truncated: true`` and ``_full_path``
+pointing at the journal file. Recipients should check ``_truncated`` and
+read the file at ``_full_path`` to recover the full body. This prevents
+Claude Code's Monitor event-body cap from silently losing the tail of a
+long message.
+
 Operational notes:
   - The watcher does NOT call register_session — that's the Claude Code
     session's job. The watcher only drains via receive_messages.
@@ -29,13 +37,21 @@ Operational notes:
     event, so the receiving LLM may see multiple JSON lines concatenated
     in one event body. Recipients should parse the event body
     line-by-line (each line is one complete message JSON).
+  - **Journal files** accumulate in ``$BROKER_INBOX_JOURNAL_DIR`` (default
+    ``/tmp/reyn-broker-inbox/<session_id>/``). They are not automatically
+    cleaned; ``/tmp`` is typically wiped at reboot on most systems. Delete
+    manually if disk pressure is a concern.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
+import re
 import sys
+import time
+from pathlib import Path
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -45,10 +61,77 @@ POLL_S = 30
 ERROR_BACKOFF_S = 10
 ERROR_QUIET_THRESHOLD = 5  # stay quiet for first N consecutive errors
 
+JOURNAL_BASE = Path(os.environ.get("BROKER_INBOX_JOURNAL_DIR", "/tmp/reyn-broker-inbox"))
+MAX_INLINE_BODY = int(os.environ.get("BROKER_WATCHER_MAX_INLINE", "1500"))
+
+_SAFE_SENDER_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
 
 def _emit(payload: dict) -> None:
-    """One JSON line to stdout, flushed."""
+    """One JSON line to stdout, flushed. Used for raw events (e.g. errors)."""
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def _journal_path(session_id: str, sender: str, ts_ms: int) -> Path:
+    sender_safe = _SAFE_SENDER_RE.sub("_", sender)[:64] or "unknown"
+    return JOURNAL_BASE / session_id / f"msg-{ts_ms}-{sender_safe}.json"
+
+
+def _write_journal(path: Path, body: str) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def _emit_message(session_id: str, msg: dict) -> None:
+    """Emit one inbox message.
+
+    The full message JSON is always written to a journal file first so
+    recipients have a guaranteed recovery path. If the JSON exceeds
+    ``MAX_INLINE_BODY`` characters, a short summary referencing the
+    journal path is emitted instead of the full payload, which keeps
+    the emitted stdout line within Claude Code's event-body cap.
+    """
+    full_json = json.dumps(msg, ensure_ascii=False)
+    sender = str(msg.get("from", "unknown"))
+    body = str(msg.get("message", ""))
+    ts_ms = int(time.time() * 1000)
+
+    path = _journal_path(session_id, sender, ts_ms)
+    journal_ok = _write_journal(path, full_json)
+
+    if len(full_json) <= MAX_INLINE_BODY:
+        print(full_json, flush=True)
+        return
+
+    if journal_ok:
+        marker = (
+            f"[long message from {sender}, {len(body)} chars — "
+            f"full text at {path}]"
+        )
+        summary = {
+            "from": sender,
+            "message": marker,
+            "_truncated": True,
+            "_full_path": str(path),
+            "_body_chars": len(body),
+        }
+    else:
+        # Journal failed; emit a marker pointing the recipient at receive_messages
+        marker = (
+            f"[long message from {sender}, {len(body)} chars — "
+            f"journal write failed, re-fetch via receive_messages]"
+        )
+        summary = {
+            "from": sender,
+            "message": marker,
+            "_truncated": True,
+            "_body_chars": len(body),
+        }
+    print(json.dumps(summary, ensure_ascii=False), flush=True)
 
 
 def _parse_messages(call_result) -> list[dict]:
@@ -106,7 +189,7 @@ async def _poll_loop(session_id: str) -> None:
                         {"session_id": session_id},
                     )
                     for msg in _parse_messages(result):
-                        _emit(msg)
+                        _emit_message(session_id, msg)
                     await asyncio.sleep(POLL_S)
         except Exception as exc:
             consecutive_errors += 1

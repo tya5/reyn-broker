@@ -103,8 +103,26 @@ In Claude Code, run it under the Monitor tool with `persistent=true`; each
 stdout line becomes a `<task-notification>` event in the LLM context, so
 messages arrive in-channel without the agent having to poll.
 
+### Long-message handling
+
+Claude Code's Monitor caps the body of a `<task-notification>` event at a
+few KB. To stop the tail of long messages getting silently dropped, the
+watcher:
+
+1. Writes every received message to a per-session journal file at
+   `$BROKER_INBOX_JOURNAL_DIR/<session_id>/msg-<unix-ms>-<sender>.json`
+   (default `/tmp/reyn-broker-inbox/...`).
+2. If the JSON-encoded message exceeds `BROKER_WATCHER_MAX_INLINE` chars
+   (default 1500), the emitted stdout line is a short summary with
+   `_truncated: true` and `_full_path` pointing at the journal file —
+   recipients read that file to recover the full body.
+
+The journal files are not auto-cleaned. `/tmp` is typically wiped at
+reboot on most systems; delete manually if disk pressure is a concern.
+
 `SESSION_GUIDE.md` documents the protocol clients should follow (session id
-conventions, when to call `receive_messages`, watcher batching semantics).
+conventions, when to call `receive_messages`, watcher batching semantics,
+how to recover from a truncated notification).
 
 ## Tests
 
