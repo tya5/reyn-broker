@@ -97,6 +97,27 @@ def _load_state() -> None:
     )
 
 
+def _drain_inbox_locked(session_id: str) -> list[dict[str, Any]]:
+    """Pop ``session_id``'s inbox, processing any ``_ack_to`` markers.
+
+    Caller MUST hold ``registry_lock``. Returns messages with internal
+    fields (``_ack_to``) stripped. For each stripped marker, queues a
+    ``read-ack`` notification into the original sender's inbox.
+    """
+    msgs = pending.pop(session_id, [])
+    ack_targets: list[str] = []
+    for m in msgs:
+        ack_to = m.pop("_ack_to", None)
+        if ack_to:
+            ack_targets.append(ack_to)
+    for ack_to in ack_targets:
+        pending[ack_to].append({
+            "from": "broker",
+            "message": f"read-ack: '{session_id}' drained your message",
+        })
+    return msgs
+
+
 async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
     entry = sessions.get(target_id)
     if entry is None or entry.mcp_session is None:
@@ -137,7 +158,7 @@ async def register_session(
             mcp_session=ctx.session,
             role=role,
         )
-        backlog = pending.pop(session_id, [])
+        backlog = _drain_inbox_locked(session_id)
         _save_state()
 
     return {
@@ -177,7 +198,12 @@ async def list_sessions() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-async def post_message(to: str, from_session: str, message: str) -> str:
+async def post_message(
+    to: str,
+    from_session: str,
+    message: str,
+    request_read_ack: bool = False,
+) -> str:
     """Send a message to another session.
 
     The message is always queued in the recipient's inbox. The recipient
@@ -185,8 +211,16 @@ async def post_message(to: str, from_session: str, message: str) -> str:
     notification is also pushed as a hint, but recipients must not rely
     on it — Claude Code does not always surface log notifications to
     the agent.
+
+    If ``request_read_ack=True``, the broker will automatically queue a
+    ``read-ack`` message back to ``from_session`` when the recipient
+    drains this message via ``receive_messages``. Use sparingly for
+    confirm-required coordination signals (block raised / pause / etc.).
+    The ack confirms the message was drained, not necessarily acted on.
     """
-    payload = {"from": from_session, "message": message}
+    payload: dict[str, Any] = {"from": from_session, "message": message}
+    if request_read_ack:
+        payload["_ack_to"] = from_session
 
     async with registry_lock:
         pending[to].append(payload)
@@ -194,7 +228,9 @@ async def post_message(to: str, from_session: str, message: str) -> str:
         _save_state()
 
     if target_online:
-        await _deliver(to, payload)
+        # Don't push the internal ack marker over the notification channel.
+        push_payload = {k: v for k, v in payload.items() if k != "_ack_to"}
+        await _deliver(to, push_payload)
 
     return f"queued for '{to}' (online={target_online})"
 
@@ -236,12 +272,37 @@ async def receive_messages(session_id: str) -> list[dict[str, Any]]:
     after ``register_session``, at the start of each turn, after
     long-running tasks, and whenever the user asks "check your inbox".
     The returned list is removed from the queue once handed back.
+
+    For any drained message whose sender requested a read-ack (via
+    ``post_message(..., request_read_ack=True)``), a ``read-ack``
+    notification is automatically queued back to the original sender's
+    inbox before this call returns.
     """
     async with registry_lock:
-        msgs = pending.pop(session_id, [])
+        msgs = _drain_inbox_locked(session_id)
         if msgs:
             _save_state()
     return msgs
+
+
+@mcp.tool()
+async def inbox_stats(session_id: str) -> dict[str, Any]:
+    """Return non-destructive stats about the inbox of ``session_id``.
+
+    Lets a caller confirm whether messages are queued (and who from)
+    without draining them. Useful for sanity-checking that a watcher
+    has not raced ahead of the caller, or for "have I been heard?"
+    diagnostics. Does NOT remove messages from the queue.
+    """
+    async with registry_lock:
+        msgs = pending.get(session_id, [])
+        senders = sorted({str(m.get("from", "unknown")) for m in msgs})
+        count = len(msgs)
+    return {
+        "session_id": session_id,
+        "pending_count": count,
+        "senders": senders,
+    }
 
 
 def main() -> None:

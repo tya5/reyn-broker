@@ -161,9 +161,10 @@ broker (v0.3.0+) は sessions メタデータ + pending キューを disk に永
 |---|---|---|
 | `register_session` | `session_id`, `working_dir`, `role` (optional) | 起動時に 1 回。戻り値の `pending_messages` を必ず処理 |
 | `list_sessions` | (なし) | 相手を探す |
-| `post_message` | `to`, `from_session`, `message` | 依頼/返信を送る (常にキュー) |
+| `post_message` | `to`, `from_session`, `message`, `request_read_ack` (optional) | 依頼/返信を送る (常にキュー)。 `request_read_ack=True` で相手 drain 時に sender 宛に `read-ack` を自動投函 |
 | `broadcast_message` | `from_session`, `message`, `exclude_self` (default true) | 全 registered session に同一 message を送る (= announce / anyone-help 用途) |
 | `receive_messages` | `session_id` | 自分の inbox を drain して取得 (ポーリング) |
+| `inbox_stats` | `session_id` | 非破壊 peek: `{pending_count, senders}` 取得、 drain しない |
 | `unregister_session` | `session_id` | 終了前に 1 回 |
 
 ---

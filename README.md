@@ -67,13 +67,25 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `register_session`  | `session_id`, `working_dir`, `role?` (optional) | Register this client. Returns `status` and `pending_messages` (drained backlog). |
 | `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
 | `list_sessions`     | —                                               | Return registered sessions (`session_id`, `working_dir`, `role`).               |
-| `post_message`      | `to`, `from_session`, `message`                 | Queue a message in the recipient's inbox.                                       |
+| `post_message`      | `to`, `from_session`, `message`, `request_read_ack?` | Queue a message in the recipient's inbox. Optionally auto-ack on drain.   |
 | `broadcast_message` | `from_session`, `message`, `exclude_self?`      | Queue the same message in every registered session's inbox (sender skipped by default). |
 | `receive_messages`  | `session_id`                                    | Drain and return the caller's inbox.                                            |
+| `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
 
 `role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so
 peers can find you via `list_sessions` without relying on naming conventions.
 It is optional; sessions that omit it appear with `role: null`.
+
+`request_read_ack=True` on `post_message` makes the broker queue a
+`read-ack` notification (from `"broker"`) back to the sender's inbox the
+moment the recipient drains via `receive_messages`. This confirms the
+message was *drained*, not that the recipient acted on it — use sparingly
+for confirm-required coordination signals such as "block raised", "I'm
+picking up #N", or "pause merge".
+
+`inbox_stats(session_id)` returns `{pending_count, senders}` without
+draining; useful for sanity-checking that a watcher has not raced ahead
+of the caller, or for "have I been heard?" diagnostics.
 
 ## Client configuration
 

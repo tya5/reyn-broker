@@ -299,6 +299,117 @@ async def test_broadcast_message_no_recipients_when_alone(broker_url: str) -> No
 
 
 @pytest.mark.asyncio
+async def test_inbox_stats_empty_for_no_messages(broker_url: str) -> None:
+    async with _client(broker_url) as c:
+        result = await c.call_tool("inbox_stats", {"session_id": "ghost"})
+    data = _payload(result)
+    assert data == {"session_id": "ghost", "pending_count": 0, "senders": []}
+
+
+@pytest.mark.asyncio
+async def test_inbox_stats_counts_and_lists_senders_without_drain(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "m1"}
+        )
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "m2"}
+        )
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "carol", "message": "m3"}
+        )
+        stats = _payload(await a.call_tool("inbox_stats", {"session_id": "bob"}))
+        assert stats["pending_count"] == 3
+        assert stats["senders"] == ["alice", "carol"]
+        # Re-running stats yields the same — non-destructive.
+        stats2 = _payload(await a.call_tool("inbox_stats", {"session_id": "bob"}))
+        assert stats2 == stats
+
+
+@pytest.mark.asyncio
+async def test_request_read_ack_delivers_ack_on_drain(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {
+                "to": "bob",
+                "from_session": "alice",
+                "message": "block raised on #N",
+                "request_read_ack": True,
+            },
+        )
+        # Before bob drains, alice has no ack
+        alice_inbox = _payload(
+            await a.call_tool("receive_messages", {"session_id": "alice"})
+        )
+        assert alice_inbox == []
+        # Bob drains
+        async with _client(broker_url) as b:
+            bob_inbox = _payload(
+                await b.call_tool("receive_messages", {"session_id": "bob"})
+            )
+        # Internal _ack_to is stripped from delivered message
+        assert bob_inbox == [{"from": "alice", "message": "block raised on #N"}]
+        # Now alice should have a read-ack from broker
+        alice_inbox = _payload(
+            await a.call_tool("receive_messages", {"session_id": "alice"})
+        )
+    assert len(alice_inbox) == 1
+    assert alice_inbox[0]["from"] == "broker"
+    assert "read-ack" in alice_inbox[0]["message"]
+    assert "bob" in alice_inbox[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_no_read_ack_when_not_requested(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {"to": "bob", "from_session": "alice", "message": "fire-and-forget"},
+        )
+        async with _client(broker_url) as b:
+            await b.call_tool("receive_messages", {"session_id": "bob"})
+        alice_inbox = _payload(
+            await a.call_tool("receive_messages", {"session_id": "alice"})
+        )
+    assert alice_inbox == []
+
+
+@pytest.mark.asyncio
+async def test_request_read_ack_persists_across_restart(broker_restart) -> None:
+    url = broker_restart()
+    async with _client(url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {
+                "to": "bob",
+                "from_session": "alice",
+                "message": "please pause",
+                "request_read_ack": True,
+            },
+        )
+
+    url = broker_restart()  # broker restart while message still pending
+    async with _client(url) as b:
+        bob_inbox = _payload(
+            await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
+        )["pending_messages"]
+    assert bob_inbox == [{"from": "alice", "message": "please pause"}]
+
+    async with _client(url) as a:
+        alice_inbox = _payload(
+            await a.call_tool("receive_messages", {"session_id": "alice"})
+        )
+    assert len(alice_inbox) == 1
+    assert alice_inbox[0]["from"] == "broker"
+    assert "read-ack" in alice_inbox[0]["message"]
+
+
+@pytest.mark.asyncio
 async def test_unregister_removal_persists_across_restart(broker_restart) -> None:
     url = broker_restart()
     async with _client(url) as c:
