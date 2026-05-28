@@ -15,6 +15,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +25,18 @@ from mcp.server.session import ServerSession
 logger = logging.getLogger("broker")
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 @dataclass
 class SessionEntry:
     session_id: str
     working_dir: str
     mcp_session: ServerSession | None  # None for entries restored from disk
     role: str | None = None
+    last_post_at: str | None = None
+    last_receive_at: str | None = None
 
 
 sessions: dict[str, SessionEntry] = {}
@@ -58,6 +65,8 @@ def _save_state() -> None:
                     "session_id": e.session_id,
                     "working_dir": e.working_dir,
                     "role": e.role,
+                    "last_post_at": e.last_post_at,
+                    "last_receive_at": e.last_receive_at,
                 }
                 for e in sessions.values()
             ],
@@ -86,6 +95,8 @@ def _load_state() -> None:
             working_dir=entry["working_dir"],
             mcp_session=None,
             role=entry.get("role"),
+            last_post_at=entry.get("last_post_at"),
+            last_receive_at=entry.get("last_receive_at"),
         )
     for sid, msgs in data.get("pending", {}).items():
         pending[sid].extend(msgs)
@@ -103,8 +114,12 @@ def _drain_inbox_locked(session_id: str) -> list[dict[str, Any]]:
     Caller MUST hold ``registry_lock``. Returns messages with internal
     fields (``_ack_to``) stripped. For each stripped marker, queues a
     ``read-ack`` notification into the original sender's inbox.
+    Also updates ``last_receive_at`` on the session entry when messages
+    are present.
     """
     msgs = pending.pop(session_id, [])
+    if msgs and session_id in sessions:
+        sessions[session_id].last_receive_at = _now_iso()
     ack_targets: list[str] = []
     for m in msgs:
         ack_to = m.pop("_ack_to", None)
@@ -183,8 +198,12 @@ async def unregister_session(session_id: str) -> str:
 async def list_sessions() -> list[dict[str, Any]]:
     """List currently registered sessions.
 
-    Each entry contains ``session_id``, ``working_dir``, and ``role``
-    (``None`` if the session did not declare one).
+    Each entry contains ``session_id``, ``working_dir``, ``role``
+    (``None`` if not declared), ``last_post_at`` (ISO-8601 UTC timestamp
+    of most recent outbound post/broadcast, ``None`` if never),
+    ``last_receive_at`` (ISO-8601 UTC timestamp of most recent inbox
+    drain, ``None`` if never), and ``inbox_unread_count`` (current
+    pending message count, non-destructive).
     """
     async with registry_lock:
         return [
@@ -192,6 +211,9 @@ async def list_sessions() -> list[dict[str, Any]]:
                 "session_id": e.session_id,
                 "working_dir": e.working_dir,
                 "role": e.role,
+                "last_post_at": e.last_post_at,
+                "last_receive_at": e.last_receive_at,
+                "inbox_unread_count": len(pending.get(e.session_id, [])),
             }
             for e in sessions.values()
         ]
@@ -218,13 +240,19 @@ async def post_message(
     confirm-required coordination signals (block raised / pause / etc.).
     The ack confirms the message was drained, not necessarily acted on.
     """
-    payload: dict[str, Any] = {"from": from_session, "message": message}
+    payload: dict[str, Any] = {
+        "from": from_session,
+        "message": message,
+        "sent_at_iso": _now_iso(),
+    }
     if request_read_ack:
         payload["_ack_to"] = from_session
 
     async with registry_lock:
         pending[to].append(payload)
         target_online = to in sessions
+        if from_session in sessions:
+            sessions[from_session].last_post_at = payload["sent_at_iso"]
         _save_state()
 
     if target_online:
@@ -250,12 +278,21 @@ async def broadcast_message(
     model is preserved (each recipient drains its own inbox via
     ``receive_messages``).
     """
-    payload = {"from": from_session, "message": message}
+    sent_at = _now_iso()
+    payload: dict[str, Any] = {
+        "from": from_session,
+        "message": message,
+        "is_broadcast": True,
+        "sent_at_iso": sent_at,
+    }
 
     async with registry_lock:
         targets = [sid for sid in sessions if not (exclude_self and sid == from_session)]
+        payload["recipient_count"] = len(targets)
         for sid in targets:
             pending[sid].append(payload)
+        if from_session in sessions:
+            sessions[from_session].last_post_at = sent_at
         _save_state()
 
     for sid in targets:

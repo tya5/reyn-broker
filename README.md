@@ -70,7 +70,7 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 |---------------------|-------------------------------------------------|---------------------------------------------------------------------------------|
 | `register_session`  | `session_id`, `working_dir`, `role?` (optional) | Register this client. Returns `status` and `pending_messages` (drained backlog). |
 | `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
-| `list_sessions`     | —                                               | Return registered sessions (`session_id`, `working_dir`, `role`).               |
+| `list_sessions`     | —                                               | Return registered sessions with `session_id`, `working_dir`, `role`, `last_post_at`, `last_receive_at`, `inbox_unread_count`. |
 | `post_message`      | `to`, `from_session`, `message`, `request_read_ack?` | Queue a message in the recipient's inbox. Optionally auto-ack on drain.   |
 | `broadcast_message` | `from_session`, `message`, `exclude_self?`      | Queue the same message in every registered session's inbox (sender skipped by default). |
 | `receive_messages`  | `session_id`                                    | Drain and return the caller's inbox.                                            |

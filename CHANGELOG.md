@@ -2,6 +2,24 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.7.0] - 2026-05-28
+
+### Added
+- **Message metadata** (`sent_at_iso`, `is_broadcast`, `recipient_count`) added to every
+  queued message payload (closes #9).
+  - All messages now carry `sent_at_iso` (ISO-8601 UTC) so recipients know when a
+    message was sent without relying on wall-clock proximity.
+  - Broadcast payloads additionally carry `is_broadcast: true` and
+    `recipient_count: N` so recipients can distinguish 1-to-many announcements
+    from 1-to-1 work signals without reading the message body.
+- **Activity timestamps + inbox count on `list_sessions`** (closes #10).
+  - Each session entry now includes `last_post_at` (most recent outbound
+    `post_message` / `broadcast_message`, ISO-8601 UTC or `null`),
+    `last_receive_at` (most recent inbox drain via `receive_messages` or
+    `register_session` backlog, ISO-8601 UTC or `null`), and
+    `inbox_unread_count` (current pending message count, non-destructive).
+  - Both timestamps are persisted to the state file and survive broker restarts.
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
@@ -81,6 +99,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - pytest integration tests, ruff lint, GitHub Actions CI on 3.10 / 3.11
   / 3.12 matrix.
 
+[0.7.0]: https://github.com/tya5/reyn-broker/releases/tag/0.7.0
 [0.6.0]: https://github.com/tya5/reyn-broker/releases/tag/0.6.0
 [0.5.1]: https://github.com/tya5/reyn-broker/releases/tag/0.5.1
 [0.5.0]: https://github.com/tya5/reyn-broker/releases/tag/0.5.0

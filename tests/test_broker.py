@@ -44,6 +44,17 @@ def _payload(result: Any) -> Any:
     return items
 
 
+def _msg_core(msg: dict) -> dict:
+    """Return only the user-visible fields of a message payload.
+
+    Strips metadata fields (``sent_at_iso``, ``is_broadcast``,
+    ``recipient_count``) so tests that care only about content can use
+    exact equality without being fragile to future metadata additions.
+    """
+    _META = {"sent_at_iso", "is_broadcast", "recipient_count"}
+    return {k: v for k, v in msg.items() if k not in _META}
+
+
 @pytest.mark.asyncio
 async def test_register_returns_empty_backlog_for_new_session(broker_url: str) -> None:
     async with _client(broker_url) as c:
@@ -268,8 +279,8 @@ async def test_broadcast_message_queues_to_all_others(broker_url: str) -> None:
                 alice_inbox = _payload(
                     await a.call_tool("receive_messages", {"session_id": "alice"})
                 )
-    assert bob_inbox == [{"from": "alice", "message": "all hands"}]
-    assert carol_inbox == [{"from": "alice", "message": "all hands"}]
+    assert [_msg_core(m) for m in bob_inbox] == [{"from": "alice", "message": "all hands"}]
+    assert [_msg_core(m) for m in carol_inbox] == [{"from": "alice", "message": "all hands"}]
     assert alice_inbox == []  # sender excluded
 
 
@@ -283,7 +294,7 @@ async def test_broadcast_message_include_self(broker_url: str) -> None:
         )
         result = await a.call_tool("receive_messages", {"session_id": "alice"})
     inbox = _payload(result)
-    assert inbox == [{"from": "alice", "message": "self too"}]
+    assert [_msg_core(m) for m in inbox] == [{"from": "alice", "message": "self too"}]
 
 
 @pytest.mark.asyncio
@@ -351,7 +362,9 @@ async def test_request_read_ack_delivers_ack_on_drain(broker_url: str) -> None:
                 await b.call_tool("receive_messages", {"session_id": "bob"})
             )
         # Internal _ack_to is stripped from delivered message
-        assert bob_inbox == [{"from": "alice", "message": "block raised on #N"}]
+        assert [_msg_core(m) for m in bob_inbox] == [
+            {"from": "alice", "message": "block raised on #N"}
+        ]
         # Now alice should have a read-ack from broker
         alice_inbox = _payload(
             await a.call_tool("receive_messages", {"session_id": "alice"})
@@ -398,7 +411,7 @@ async def test_request_read_ack_persists_across_restart(broker_restart) -> None:
         bob_inbox = _payload(
             await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
         )["pending_messages"]
-    assert bob_inbox == [{"from": "alice", "message": "please pause"}]
+    assert [_msg_core(m) for m in bob_inbox] == [{"from": "alice", "message": "please pause"}]
 
     async with _client(url) as a:
         alice_inbox = _payload(
@@ -420,3 +433,139 @@ async def test_unregister_removal_persists_across_restart(broker_restart) -> Non
     async with _client(url) as c:
         result = await c.call_tool("list_sessions", {})
     assert _payload(result) == []
+
+
+# ---------------------------------------------------------------------------
+# #9 — message metadata (sent_at_iso, is_broadcast, recipient_count)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_message_payload_has_sent_at_iso(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "hi"}
+        )
+        msgs = _payload(await a.call_tool("receive_messages", {"session_id": "bob"}))
+    assert len(msgs) == 1
+    assert "sent_at_iso" in msgs[0]
+    assert msgs[0]["sent_at_iso"].startswith("20")  # ISO-8601 sanity
+    assert "is_broadcast" not in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_payload_has_metadata_fields(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        async with _client(broker_url) as b:
+            await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
+            async with _client(broker_url) as c:
+                await c.call_tool(
+                    "register_session", {"session_id": "carol", "working_dir": "/tmp/c"}
+                )
+                await a.call_tool(
+                    "broadcast_message",
+                    {"from_session": "alice", "message": "hello all"},
+                )
+                bob_msgs = _payload(await b.call_tool("receive_messages", {"session_id": "bob"}))
+    assert len(bob_msgs) == 1
+    msg = bob_msgs[0]
+    assert msg["is_broadcast"] is True
+    assert msg["recipient_count"] == 2  # bob + carol, alice excluded
+    assert "sent_at_iso" in msg
+    assert msg["sent_at_iso"].startswith("20")
+
+
+# ---------------------------------------------------------------------------
+# #10 — list_sessions activity timestamps and inbox_unread_count
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_includes_activity_fields(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        result = await a.call_tool("list_sessions", {})
+    [alice] = _payload(result)
+    # Fields must be present
+    assert "last_post_at" in alice
+    assert "last_receive_at" in alice
+    assert "inbox_unread_count" in alice
+    # No activity yet — all None / 0
+    assert alice["last_post_at"] is None
+    assert alice["last_receive_at"] is None
+    assert alice["inbox_unread_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_last_post_at_updated_after_post_message(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        before = _payload(await a.call_tool("list_sessions", {}))
+        assert before[0]["last_post_at"] is None
+
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "ping"}
+        )
+        after = _payload(await a.call_tool("list_sessions", {}))
+    assert after[0]["last_post_at"] is not None
+    assert after[0]["last_post_at"].startswith("20")
+
+
+@pytest.mark.asyncio
+async def test_last_receive_at_updated_after_receive_messages(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        async with _client(broker_url) as b:
+            await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
+            await a.call_tool(
+                "post_message", {"to": "bob", "from_session": "alice", "message": "hey"}
+            )
+            before = {s["session_id"]: s for s in _payload(await b.call_tool("list_sessions", {}))}
+            assert before["bob"]["last_receive_at"] is None
+
+            await b.call_tool("receive_messages", {"session_id": "bob"})
+            after = {s["session_id"]: s for s in _payload(await b.call_tool("list_sessions", {}))}
+    assert after["bob"]["last_receive_at"] is not None
+    assert after["bob"]["last_receive_at"].startswith("20")
+
+
+@pytest.mark.asyncio
+async def test_inbox_unread_count_reflects_pending(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "m1"}
+        )
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "m2"}
+        )
+        sessions = _payload(await a.call_tool("list_sessions", {}))
+    # bob is not registered but unread count is still tracked
+    alice_entry = next(s for s in sessions if s["session_id"] == "alice")
+    assert alice_entry["inbox_unread_count"] == 0  # alice sent, did not receive
+
+
+@pytest.mark.asyncio
+async def test_activity_timestamps_persist_across_restart(broker_restart) -> None:
+    url = broker_restart()
+    async with _client(url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "ping"}
+        )
+        sessions_before = {
+            s["session_id"]: s
+            for s in _payload(await a.call_tool("list_sessions", {}))
+        }
+    ts = sessions_before["alice"]["last_post_at"]
+    assert ts is not None
+
+    url = broker_restart()
+    async with _client(url) as c:
+        sessions_after = {
+            s["session_id"]: s
+            for s in _payload(await c.call_tool("list_sessions", {}))
+        }
+    assert sessions_after["alice"]["last_post_at"] == ts
