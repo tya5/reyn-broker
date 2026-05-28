@@ -2,6 +2,33 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.8.0] - 2026-05-28
+
+### Added
+- **Inline preview on truncated notifications** (`session_watcher.py`). When a
+  message exceeds `MAX_INLINE_BODY`, the summary line now includes a `_preview`
+  field with the first ~100 chars of the body (as many as fit within the
+  `MAX_INLINE_BODY` budget). Recipients can use `_preview` for routing decisions
+  without a separate `Read` round-trip; `_full_path` is still available for the
+  complete body.
+- **Multi-recipient `post_message`** — new optional `recipients: list[str]`
+  parameter. When provided, the message is queued in every listed session's
+  inbox in one call (supersedes `to`). Returns a summary of online/offline
+  counts. Backward compatible: omitting `recipients` keeps the original `to`
+  single-target behaviour.
+- **Message TTL** — new optional `ttl_seconds: int` parameter on `post_message`.
+  Sets an expiry timestamp (`_expires_at`) on the queued message. Expired
+  messages are silently dropped on the next `receive_messages` drain or
+  `inbox_stats` call. The `_expires_at` field is stripped from delivered
+  messages and never reaches recipients.
+
+### Changed
+- `SESSION_GUIDE.md` — Monitor command updated to use the broker venv Python
+  (`/path/to/broker/.venv/bin/python`) with an explicit warning that the system
+  `python3` will fail with `ModuleNotFoundError: No module named 'mcp'`.
+- `SESSION_GUIDE.md` — truncated notification handling updated to document the
+  new `_preview` field.
+
 ## [0.7.0] - 2026-05-28
 
 ### Added
@@ -99,6 +126,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - pytest integration tests, ruff lint, GitHub Actions CI on 3.10 / 3.11
   / 3.12 matrix.
 
+[0.8.0]: https://github.com/tya5/reyn-broker/releases/tag/0.8.0
 [0.7.0]: https://github.com/tya5/reyn-broker/releases/tag/0.7.0
 [0.6.0]: https://github.com/tya5/reyn-broker/releases/tag/0.6.0
 [0.5.1]: https://github.com/tya5/reyn-broker/releases/tag/0.5.1

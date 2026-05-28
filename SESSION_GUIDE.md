@@ -225,11 +225,15 @@ Monitor を起動:
 ```
 Monitor(
   description="broker inbox watcher",
-  command="python /path/to/broker/session_watcher.py --session=<自分の session_id>",
+  command="/Users/yasudatetsuya/Workspace/reyn_dev/broker/.venv/bin/python /Users/yasudatetsuya/Workspace/reyn_dev/broker/session_watcher.py --session=<自分の session_id>",
   persistent=true,
   timeout_ms=3600000,  # 1 時間 (必要に応じて延長)
 )
 ```
+
+**⚠️ 重要: 必ず broker の `.venv/bin/python` を使うこと。**
+素の `python` / `python3` で実行すると `ModuleNotFoundError: No module named 'mcp'` で即落ちる。
+broker の venv パスは `/Users/yasudatetsuya/Workspace/reyn_dev/broker/.venv/bin/python`。
 
 `<自分の session_id>` は `register_session` で使ったのと同じ値 (= basename(pwd))。
 
@@ -265,15 +269,17 @@ per-session journal file (`/tmp/reyn-broker-inbox/<session_id>/msg-<ts>-<sender>
   "message": "[long message from <sender>, N chars — full text at /tmp/...]",
   "_truncated": true,
   "_full_path": "/tmp/reyn-broker-inbox/<self>/msg-<ts>-<sender>.json",
-  "_body_chars": N
+  "_body_chars": N,
+  "_preview": "<先頭 ~100 chars>"
 }
 ```
 
 受信側の処理:
 1. event body 各行を JSON parse
-2. **`_truncated` field が true の場合**: `_full_path` を Read tool で開いて
-   原 JSON を取得 → 中の `"message"` field が本来の本文
-3. `_truncated` が無い / false なら従来通り `message` field をそのまま使う
+2. **`_truncated` field が true の場合**:
+   - まず `_preview` で内容の概要を確認 (routing 判断に十分なら `Read` 不要)
+   - full body が必要な場合は `_full_path` を Read tool で開いて原 JSON を取得 → `"message"` field が本来の本文
+3. `_truncated` が無い / false なら `message` field をそのまま使う
 
 journal file は auto cleanup されない (= `/tmp` 配下なので再起動で消える)。
 

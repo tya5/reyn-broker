@@ -9,7 +9,11 @@ when the Claude Code session is otherwise idle.
 
 Usage (typically as a Monitor command):
 
-    python3 /path/to/broker/session_watcher.py --session=<id>
+    /path/to/broker/.venv/bin/python /path/to/broker/session_watcher.py --session=<id>
+
+IMPORTANT: run with the broker's own virtualenv Python so that the ``mcp``
+package is available. Using the system ``python3`` will fail with
+``ModuleNotFoundError: No module named 'mcp'``.
 
 Output (per arrived message, one JSON line):
 
@@ -17,11 +21,12 @@ Output (per arrived message, one JSON line):
 
 For messages whose JSON encoding exceeds ``MAX_INLINE_BODY`` characters,
 the watcher writes the full body to a per-session journal file and emits
-a *summary* line instead, with ``_truncated: true`` and ``_full_path``
-pointing at the journal file. Recipients should check ``_truncated`` and
-read the file at ``_full_path`` to recover the full body. This prevents
-Claude Code's Monitor event-body cap from silently losing the tail of a
-long message.
+a *summary* line instead, with ``_truncated: true``, ``_full_path``
+pointing at the journal file, and ``_preview`` containing the first N
+characters of the body inline. Recipients can use ``_preview`` for quick
+routing decisions and fall back to ``_full_path`` for the full body.
+This prevents Claude Code's Monitor event-body cap from silently losing
+the tail of a long message.
 
 Operational notes:
   - The watcher does NOT call register_session — that's the Claude Code
@@ -92,8 +97,13 @@ def _emit_message(session_id: str, msg: dict) -> None:
     The full message JSON is always written to a journal file first so
     recipients have a guaranteed recovery path. If the JSON exceeds
     ``MAX_INLINE_BODY`` characters, a short summary referencing the
-    journal path is emitted instead of the full payload, which keeps
-    the emitted stdout line within Claude Code's event-body cap.
+    journal path is emitted instead of the full payload.
+
+    The summary always includes a ``_preview`` field with the first N
+    characters of the body that fit within the ``MAX_INLINE_BODY``
+    budget, so recipients can make routing decisions without a separate
+    ``Read`` round-trip in the common case. Use ``_full_path`` for the
+    complete body.
     """
     full_json = json.dumps(msg, ensure_ascii=False)
     sender = str(msg.get("from", "unknown"))
@@ -112,13 +122,21 @@ def _emit_message(session_id: str, msg: dict) -> None:
             f"[long message from {sender}, {len(body)} chars — "
             f"full text at {path}]"
         )
-        summary = {
+        summary: dict = {
             "from": sender,
             "message": marker,
             "_truncated": True,
             "_full_path": str(path),
             "_body_chars": len(body),
         }
+        # Fit an inline preview within the remaining MAX_INLINE_BODY budget.
+        # Compute how many raw body chars fit after accounting for the base
+        # JSON and the key/quotes/comma overhead of adding "_preview":"...".
+        base_len = len(json.dumps(summary, ensure_ascii=False))
+        # overhead: ,"_preview":"" → 13 chars, plus closing } already counted
+        preview_budget = MAX_INLINE_BODY - base_len - 13
+        if body and preview_budget > 20:
+            summary["_preview"] = body[:preview_budget]
     else:
         # Journal failed; emit a marker pointing the recipient at receive_messages
         marker = (

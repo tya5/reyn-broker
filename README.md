@@ -71,7 +71,7 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `register_session`  | `session_id`, `working_dir`, `role?` (optional) | Register this client. Returns `status` and `pending_messages` (drained backlog). |
 | `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
 | `list_sessions`     | —                                               | Return registered sessions with `session_id`, `working_dir`, `role`, `last_post_at`, `last_receive_at`, `inbox_unread_count`. |
-| `post_message`      | `to`, `from_session`, `message`, `request_read_ack?` | Queue a message in the recipient's inbox. Optionally auto-ack on drain.   |
+| `post_message`      | `to`, `from_session`, `message`, `request_read_ack?`, `recipients?`, `ttl_seconds?` | Queue a message. `recipients=[...]` for multi-target; `ttl_seconds` for auto-expiry. |
 | `broadcast_message` | `from_session`, `message`, `exclude_self?`      | Queue the same message in every registered session's inbox (sender skipped by default). |
 | `receive_messages`  | `session_id`                                    | Drain and return the caller's inbox.                                            |
 | `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
@@ -112,8 +112,11 @@ Each MCP client adds an entry to its config (Claude Code reads `.mcp.json`):
 of a session and emits one JSON line to stdout per arrived message:
 
 ```bash
-python /path/to/broker/session_watcher.py --session=<your-session-id>
+/path/to/broker/.venv/bin/python /path/to/broker/session_watcher.py --session=<your-session-id>
 ```
+
+> **Note:** use the broker's own virtualenv Python. The system `python3` will fail with
+> `ModuleNotFoundError: No module named 'mcp'`.
 
 In Claude Code, run it under the Monitor tool with `persistent=true`; each
 stdout line becomes a `<task-notification>` event in the LLM context, so
@@ -130,11 +133,11 @@ watcher:
    (default `/tmp/reyn-broker-inbox/...`).
 2. If the JSON-encoded message exceeds `BROKER_WATCHER_MAX_INLINE` chars
    (default 400), the emitted stdout line is a short summary with
-   `_truncated: true` and `_full_path` pointing at the journal file —
-   recipients read that file to recover the full body. The default was
-   tuned empirically against Claude Code's Monitor cut-off, which sits
-   around 500 characters in practice; lower the limit further if you
-   observe multiple short messages batching past the cap.
+   `_truncated: true`, `_full_path` pointing at the journal file, and
+   `_preview` with the first ~100 chars of the body inline — so recipients
+   can make routing decisions without a `Read` round-trip in most cases.
+   The default was tuned empirically against Claude Code's Monitor cut-off,
+   which sits around 500 characters in practice.
 
 The journal files are not auto-cleaned. `/tmp` is typically wiped at
 reboot on most systems; delete manually if disk pressure is a concern.

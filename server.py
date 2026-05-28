@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -108,29 +109,43 @@ def _load_state() -> None:
     )
 
 
+def _purge_expired(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop messages whose ``_expires_at`` epoch timestamp is in the past."""
+    now = time.time()
+    return [m for m in msgs if not (m.get("_expires_at") and m["_expires_at"] < now)]
+
+
+def _strip_internal(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``msg`` with all internal ``_*`` fields removed."""
+    return {k: v for k, v in msg.items() if not k.startswith("_")}
+
+
 def _drain_inbox_locked(session_id: str) -> list[dict[str, Any]]:
     """Pop ``session_id``'s inbox, processing any ``_ack_to`` markers.
 
-    Caller MUST hold ``registry_lock``. Returns messages with internal
-    fields (``_ack_to``) stripped. For each stripped marker, queues a
-    ``read-ack`` notification into the original sender's inbox.
-    Also updates ``last_receive_at`` on the session entry when messages
-    are present.
+    Caller MUST hold ``registry_lock``. Expired messages (``_expires_at``
+    in the past) are silently dropped before processing. Returns messages
+    with all internal fields (``_ack_to``, ``_expires_at``) stripped. For
+    each stripped ``_ack_to`` marker, queues a ``read-ack`` notification
+    into the original sender's inbox.  Also updates ``last_receive_at``
+    on the session entry when messages are present.
     """
-    msgs = pending.pop(session_id, [])
-    if msgs and session_id in sessions:
+    raw = _purge_expired(pending.pop(session_id, []))
+    if raw and session_id in sessions:
         sessions[session_id].last_receive_at = _now_iso()
     ack_targets: list[str] = []
-    for m in msgs:
-        ack_to = m.pop("_ack_to", None)
+    out: list[dict[str, Any]] = []
+    for m in raw:
+        ack_to = m.get("_ack_to")
         if ack_to:
             ack_targets.append(ack_to)
+        out.append(_strip_internal(m))
     for ack_to in ack_targets:
         pending[ack_to].append({
             "from": "broker",
             "message": f"read-ack: '{session_id}' drained your message",
         })
-    return msgs
+    return out
 
 
 async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
@@ -225,42 +240,71 @@ async def post_message(
     from_session: str,
     message: str,
     request_read_ack: bool = False,
+    recipients: list[str] | None = None,
+    ttl_seconds: int | None = None,
 ) -> str:
-    """Send a message to another session.
+    """Send a message to one or more sessions.
 
-    The message is always queued in the recipient's inbox. The recipient
-    picks it up by calling ``receive_messages``. A best-effort log
+    The message is always queued in each recipient's inbox. Recipients
+    pick it up by calling ``receive_messages``. A best-effort log
     notification is also pushed as a hint, but recipients must not rely
     on it — Claude Code does not always surface log notifications to
     the agent.
 
-    If ``request_read_ack=True``, the broker will automatically queue a
-    ``read-ack`` message back to ``from_session`` when the recipient
+    **Single recipient** (default): pass ``to`` as the target session id.
+
+    **Multiple recipients**: pass ``recipients=[...]`` with a list of
+    session ids. When ``recipients`` is provided it takes precedence over
+    ``to``; ``to`` is then ignored. Returns a summary of how many
+    recipients were online/offline.
+
+    ``request_read_ack=True`` makes the broker automatically queue a
+    ``read-ack`` message back to ``from_session`` when *each* recipient
     drains this message via ``receive_messages``. Use sparingly for
     confirm-required coordination signals (block raised / pause / etc.).
     The ack confirms the message was drained, not necessarily acted on.
+
+    ``ttl_seconds`` sets an expiry time on the message. If a recipient
+    has not drained the message before the TTL elapses, the message is
+    silently dropped on the next drain or ``inbox_stats`` call. Use for
+    time-sensitive coordination signals where a stale message would cause
+    confusion (e.g. "deploy window open for the next 5 minutes").
     """
+    sent_at = _now_iso()
+    targets = recipients if recipients is not None else [to]
+
     payload: dict[str, Any] = {
         "from": from_session,
         "message": message,
-        "sent_at_iso": _now_iso(),
+        "sent_at_iso": sent_at,
     }
     if request_read_ack:
         payload["_ack_to"] = from_session
+    if ttl_seconds is not None:
+        payload["_expires_at"] = time.time() + ttl_seconds
+
+    online: list[str] = []
+    offline: list[str] = []
 
     async with registry_lock:
-        pending[to].append(payload)
-        target_online = to in sessions
+        for target in targets:
+            pending[target].append(dict(payload))
+            (online if target in sessions else offline).append(target)
         if from_session in sessions:
-            sessions[from_session].last_post_at = payload["sent_at_iso"]
+            sessions[from_session].last_post_at = sent_at
         _save_state()
 
-    if target_online:
-        # Don't push the internal ack marker over the notification channel.
-        push_payload = {k: v for k, v in payload.items() if k != "_ack_to"}
-        await _deliver(to, push_payload)
+    for target in online:
+        push_payload = _strip_internal(payload)
+        await _deliver(target, push_payload)
 
-    return f"queued for '{to}' (online={target_online})"
+    if len(targets) == 1:
+        return f"queued for '{targets[0]}' (online={targets[0] in online})"
+    return (
+        f"queued for {len(targets)} recipients"
+        f" (online: {', '.join(online) or 'none'}"
+        f"; offline: {', '.join(offline) or 'none'})"
+    )
 
 
 @mcp.tool()
@@ -332,7 +376,7 @@ async def inbox_stats(session_id: str) -> dict[str, Any]:
     diagnostics. Does NOT remove messages from the queue.
     """
     async with registry_lock:
-        msgs = pending.get(session_id, [])
+        msgs = _purge_expired(pending.get(session_id, []))
         senders = sorted({str(m.get("from", "unknown")) for m in msgs})
         count = len(msgs)
     return {

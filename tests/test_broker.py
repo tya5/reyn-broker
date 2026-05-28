@@ -569,3 +569,123 @@ async def test_activity_timestamps_persist_across_restart(broker_restart) -> Non
             for s in _payload(await c.call_tool("list_sessions", {}))
         }
     assert sessions_after["alice"]["last_post_at"] == ts
+
+
+# ---------------------------------------------------------------------------
+# multi-recipient (post_message recipients=[...])
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_message_multi_recipient_delivers_to_all(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {
+                "to": "alice",  # overridden by recipients
+                "from_session": "alice",
+                "message": "hello all",
+                "recipients": ["bob", "carol"],
+            },
+        )
+        bob_msgs = _payload(await a.call_tool("receive_messages", {"session_id": "bob"}))
+        carol_msgs = _payload(await a.call_tool("receive_messages", {"session_id": "carol"}))
+    assert len(bob_msgs) == 1
+    assert _msg_core(bob_msgs[0]) == {"from": "alice", "message": "hello all"}
+    assert len(carol_msgs) == 1
+    assert _msg_core(carol_msgs[0]) == {"from": "alice", "message": "hello all"}
+
+
+@pytest.mark.asyncio
+async def test_post_message_multi_recipient_return_format(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        async with _client(broker_url) as b:
+            await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
+            result = await a.call_tool(
+                "post_message",
+                {
+                    "to": "alice",
+                    "from_session": "alice",
+                    "message": "ping",
+                    "recipients": ["bob", "ghost"],  # bob online, ghost offline
+                },
+            )
+    text = result.content[0].text
+    assert "2 recipients" in text
+    assert "bob" in text
+    assert "ghost" in text
+
+
+@pytest.mark.asyncio
+async def test_post_message_single_recipient_backward_compat(broker_url: str) -> None:
+    """recipients=None → original to= behaviour preserved."""
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        result = await a.call_tool(
+            "post_message",
+            {"to": "bob", "from_session": "alice", "message": "hi"},
+        )
+    text = result.content[0].text
+    assert "bob" in text
+    assert "online=" in text  # original single-recipient format
+
+
+# ---------------------------------------------------------------------------
+# TTL / message expiry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ttl_message_expires_before_drain(broker_url: str) -> None:
+    import asyncio as _asyncio
+
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {"to": "bob", "from_session": "alice", "message": "time-sensitive", "ttl_seconds": 1},
+        )
+        # Let TTL elapse
+        await _asyncio.sleep(1.5)
+        msgs = _payload(await a.call_tool("receive_messages", {"session_id": "bob"}))
+    assert msgs == []  # expired — should be dropped
+
+
+@pytest.mark.asyncio
+async def test_ttl_message_delivered_before_expiry(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {
+                "to": "bob",
+                "from_session": "alice",
+                "message": "still fresh",
+                "ttl_seconds": 60,
+            },
+        )
+        msgs = _payload(await a.call_tool("receive_messages", {"session_id": "bob"}))
+    assert len(msgs) == 1
+    assert _msg_core(msgs[0]) == {"from": "alice", "message": "still fresh"}
+    # Internal _expires_at must not leak to recipients
+    assert "_expires_at" not in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_ttl_inbox_stats_excludes_expired(broker_url: str) -> None:
+    import asyncio as _asyncio
+
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {"to": "bob", "from_session": "alice", "message": "expires soon", "ttl_seconds": 1},
+        )
+        stats_before = _payload(await a.call_tool("inbox_stats", {"session_id": "bob"}))
+        assert stats_before["pending_count"] == 1
+
+        await _asyncio.sleep(1.5)
+        stats_after = _payload(await a.call_tool("inbox_stats", {"session_id": "bob"}))
+    assert stats_after["pending_count"] == 0
