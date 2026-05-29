@@ -164,6 +164,43 @@ async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
         return False
 
 
+def _register_locked(
+    session_id: str,
+    working_dir: str,
+    mcp_session: Any,
+    role: str | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Register a session and drain its inbox.  Caller MUST hold ``registry_lock``."""
+    sessions[session_id] = SessionEntry(
+        session_id=session_id,
+        working_dir=working_dir,
+        mcp_session=mcp_session,
+        role=role,
+    )
+    backlog = _drain_inbox_locked(session_id)
+    return f"registered '{session_id}' at {working_dir}", backlog
+
+
+def _session_list_locked(compact: bool) -> list[dict[str, Any]]:
+    """Serialise the session registry.  Caller MUST hold ``registry_lock``."""
+    if compact:
+        return [
+            {"session_id": e.session_id, "role": e.role}
+            for e in sessions.values()
+        ]
+    return [
+        {
+            "session_id": e.session_id,
+            "working_dir": e.working_dir,
+            "role": e.role,
+            "last_post_at": e.last_post_at,
+            "last_receive_at": e.last_receive_at,
+            "inbox_unread_count": len(_purge_expired(pending.get(e.session_id, []))),
+        }
+        for e in sessions.values()
+    ]
+
+
 @mcp.tool()
 async def register_session(
     session_id: str,
@@ -180,21 +217,45 @@ async def register_session(
     via ``list_sessions`` without guessing from naming conventions.
 
     Returns any messages that were queued while this session was offline.
+    Prefer ``startup_summary`` at startup to combine this call with
+    ``list_sessions`` in one round-trip.
     """
     async with registry_lock:
-        sessions[session_id] = SessionEntry(
-            session_id=session_id,
-            working_dir=working_dir,
-            mcp_session=ctx.session,
-            role=role,
-        )
-        backlog = _drain_inbox_locked(session_id)
+        status, backlog = _register_locked(session_id, working_dir, ctx.session, role)
         _save_state()
 
-    return {
-        "status": f"registered '{session_id}' at {working_dir}",
-        "pending_messages": backlog,
-    }
+    return {"status": status, "pending_messages": backlog}
+
+
+@mcp.tool()
+async def startup_summary(
+    session_id: str,
+    working_dir: str,
+    ctx: Context,
+    role: str | None = None,
+    compact: bool = True,
+) -> dict[str, Any]:
+    """Register this session and return the peer list in a single round-trip.
+
+    Replaces the common startup pattern of calling ``register_session``
+    followed by ``list_sessions``.  Returns the same data as both combined:
+
+    - ``status`` — registration confirmation string.
+    - ``pending_messages`` — backlog drained from this session's inbox
+      (same as ``register_session`` return value).
+    - ``sessions`` — list of currently registered sessions; compact by
+      default (``session_id`` + ``role`` only).  Pass ``compact=False``
+      for the full shape including activity timestamps.
+
+    Using this instead of two separate calls reduces MCP tool invocations
+    and the token overhead of two tool results in context.
+    """
+    async with registry_lock:
+        status, backlog = _register_locked(session_id, working_dir, ctx.session, role)
+        session_list = _session_list_locked(compact)
+        _save_state()
+
+    return {"status": status, "pending_messages": backlog, "sessions": session_list}
 
 
 @mcp.tool()
@@ -210,28 +271,22 @@ async def unregister_session(session_id: str) -> str:
 
 
 @mcp.tool()
-async def list_sessions() -> list[dict[str, Any]]:
+async def list_sessions(compact: bool = False) -> list[dict[str, Any]]:
     """List currently registered sessions.
 
-    Each entry contains ``session_id``, ``working_dir``, ``role``
-    (``None`` if not declared), ``last_post_at`` (ISO-8601 UTC timestamp
-    of most recent outbound post/broadcast, ``None`` if never),
-    ``last_receive_at`` (ISO-8601 UTC timestamp of most recent inbox
-    drain, ``None`` if never), and ``inbox_unread_count`` (current
-    pending message count, non-destructive).
+    When ``compact=True`` (recommended for most callers), returns only
+    ``session_id`` and ``role`` — enough to decide who to send a message
+    to, at roughly 60 % lower token cost than the full shape.
+
+    When ``compact=False`` (default for backward compatibility), each
+    entry also includes ``working_dir``, ``last_post_at``,
+    ``last_receive_at``, and ``inbox_unread_count``.
+
+    Tip: at startup use ``startup_summary`` instead — it combines
+    ``register_session`` + ``list_sessions`` into one round-trip.
     """
     async with registry_lock:
-        return [
-            {
-                "session_id": e.session_id,
-                "working_dir": e.working_dir,
-                "role": e.role,
-                "last_post_at": e.last_post_at,
-                "last_receive_at": e.last_receive_at,
-                "inbox_unread_count": len(pending.get(e.session_id, [])),
-            }
-            for e in sessions.values()
-        ]
+        return _session_list_locked(compact)
 
 
 @mcp.tool()
@@ -346,7 +401,10 @@ async def broadcast_message(
 
 
 @mcp.tool()
-async def receive_messages(session_id: str) -> list[dict[str, Any]]:
+async def receive_messages(
+    session_id: str,
+    fields: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Drain and return all queued messages addressed to ``session_id``.
 
     Each Claude Code session should call this proactively — at startup
@@ -358,11 +416,19 @@ async def receive_messages(session_id: str) -> list[dict[str, Any]]:
     ``post_message(..., request_read_ack=True)``), a ``read-ack``
     notification is automatically queued back to the original sender's
     inbox before this call returns.
+
+    ``fields`` — optional list of keys to include in each returned
+    message (e.g. ``["from", "message"]``).  Omitting metadata fields
+    such as ``sent_at_iso``, ``is_broadcast``, and ``recipient_count``
+    can significantly reduce token overhead when those fields are not
+    needed.  Defaults to ``None`` (all fields returned).
     """
     async with registry_lock:
         msgs = _drain_inbox_locked(session_id)
         if msgs:
             _save_state()
+    if fields is not None:
+        msgs = [{k: v for k, v in m.items() if k in fields} for m in msgs]
     return msgs
 
 

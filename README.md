@@ -87,10 +87,11 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 |---------------------|-------------------------------------------------|---------------------------------------------------------------------------------|
 | `register_session`  | `session_id`, `working_dir`, `role?` (optional) | Register this client. Returns `status` and `pending_messages` (drained backlog). |
 | `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
-| `list_sessions`     | —                                               | Return registered sessions with `session_id`, `working_dir`, `role`, `last_post_at`, `last_receive_at`, `inbox_unread_count`. |
+| `startup_summary`   | `session_id`, `working_dir`, `role?`, `compact?` | Register + list in one round-trip. Returns `status`, `pending_messages`, and `sessions` (compact by default). |
+| `list_sessions`     | `compact?`                                      | Return registered sessions. `compact=True` returns only `session_id`+`role` (~60% fewer tokens). Full shape includes activity timestamps. |
 | `post_message`      | `to`, `from_session`, `message`, `request_read_ack?`, `recipients?`, `ttl_seconds?` | Queue a message. `recipients=[...]` for multi-target; `ttl_seconds` for auto-expiry. |
 | `broadcast_message` | `from_session`, `message`, `exclude_self?`      | Queue the same message in every registered session's inbox (sender skipped by default). |
-| `receive_messages`  | `session_id`                                    | Drain and return the caller's inbox.                                            |
+| `receive_messages`  | `session_id`, `fields?`                         | Drain and return the caller's inbox. `fields=["from","message"]` strips metadata to reduce token overhead. |
 | `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
 
 `role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so

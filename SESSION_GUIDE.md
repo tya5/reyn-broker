@@ -193,16 +193,67 @@ Claude Code は MCP サーバーのツール一覧を **セッション起動時
 
 ---
 
+## 5.9. トークン節約ガイドライン
+
+broker MCP の呼び出し結果は LLM context に入るため、不要な呼び出しや大きなペイロードはトークンコストに直結する。以下を原則とすること。
+
+### startup_summary を使う（register + list を 1 回にまとめる）
+
+```
+# ❌ 2 回呼ぶ
+register_session(session_id=..., working_dir=..., role=...)
+list_sessions()
+
+# ✅ 1 回で済む
+startup_summary(session_id=..., working_dir=..., role=...)
+# → {status, pending_messages, sessions: [...compact...]} を一括取得
+```
+
+### list_sessions は compact=True を原則使用
+
+```
+# ❌ フルシェイプ（8セッション × 6フィールド ≈ 1600 chars）
+list_sessions()
+
+# ✅ コンパクト（session_id + role のみ、約 60% 削減）
+list_sessions(compact=True)
+
+# full shape が必要なのは activity timestamp や inbox_unread_count を見る時のみ
+```
+
+### list_sessions は必要な時だけ呼ぶ
+
+- 起動時（startup_summary で同時取得）
+- 新しい送信先を探す時
+- **ターンごとに毎回呼ばない**（セッション一覧は頻繁に変わらない）
+
+### receive_messages は fields で絞り込む
+
+```
+# ❌ 全フィールド（sent_at_iso, is_broadcast, recipient_count 等を含む）
+receive_messages(session_id="self")
+
+# ✅ 必要なフィールドのみ（大半のケースはこれで十分）
+receive_messages(session_id="self", fields=["from", "message"])
+```
+
+### inbox_stats は「相手の確認」専用
+
+`inbox_stats` は自分の inbox 確認に使わない。drain するつもりなら `receive_messages` を直接呼ぶ（2回呼ぶのは無駄）。`inbox_stats` の用途は「相手がまだ読んでいないか確認する」。
+
+---
+
 ## 6. 利用可能なツール早見表
 
 | ツール | 引数 | 用途 |
 |---|---|---|
-| `register_session` | `session_id`, `working_dir`, `role` (optional) | 起動時に 1 回。戻り値の `pending_messages` を必ず処理 |
-| `list_sessions` | (なし) | 相手を探す |
-| `post_message` | `to`, `from_session`, `message`, `request_read_ack` (optional) | 依頼/返信を送る (常にキュー)。 `request_read_ack=True` で相手 drain 時に sender 宛に `read-ack` を自動投函 |
-| `broadcast_message` | `from_session`, `message`, `exclude_self` (default true) | 全 registered session に同一 message を送る (= announce / anyone-help 用途) |
-| `receive_messages` | `session_id` | 自分の inbox を drain して取得 (ポーリング) |
-| `inbox_stats` | `session_id` | 非破壊 peek: `{pending_count, senders}` 取得、 drain しない |
+| `startup_summary` | `session_id`, `working_dir`, `role?`, `compact?` (default true) | **起動時推奨** — register + list を 1 回に統合。`pending_messages` + `sessions` を同時取得 |
+| `register_session` | `session_id`, `working_dir`, `role?` | register のみ（list 不要な場合）。戻り値の `pending_messages` を必ず処理 |
+| `list_sessions` | `compact?` (default false) | 相手を探す。**原則 `compact=True` を使う**（session_id + role のみ） |
+| `post_message` | `to`, `from_session`, `message`, `request_read_ack?`, `recipients?`, `ttl_seconds?` | 依頼/返信を送る。`recipients=[...]` で複数宛先、`ttl_seconds` で自動期限切れ |
+| `broadcast_message` | `from_session`, `message`, `exclude_self?` (default true) | 全 registered session に一斉送信 |
+| `receive_messages` | `session_id`, `fields?` | 自分の inbox を drain。**`fields=["from","message"]` で不要な metadata を除いてトークン削減** |
+| `inbox_stats` | `session_id` | 非破壊 peek: `{pending_count, senders}`。自分の確認より**相手の確認**に使う |
 | `unregister_session` | `session_id` | 終了前に 1 回 |
 
 ---

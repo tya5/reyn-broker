@@ -689,3 +689,135 @@ async def test_ttl_inbox_stats_excludes_expired(broker_url: str) -> None:
         await _asyncio.sleep(1.5)
         stats_after = _payload(await a.call_tool("inbox_stats", {"session_id": "bob"}))
     assert stats_after["pending_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# compact list_sessions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_compact_returns_only_id_and_role(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool(
+            "register_session",
+            {"session_id": "alice", "working_dir": "/tmp/a", "role": "tester"},
+        )
+        result = _payload(await a.call_tool("list_sessions", {"compact": True}))
+    assert result == [{"session_id": "alice", "role": "tester"}]
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_compact_false_returns_full_shape(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        result = _payload(await a.call_tool("list_sessions", {"compact": False}))
+    assert len(result) == 1
+    assert "working_dir" in result[0]
+    assert "last_post_at" in result[0]
+    assert "inbox_unread_count" in result[0]
+
+
+# ---------------------------------------------------------------------------
+# startup_summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_startup_summary_registers_and_returns_sessions(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        result = _payload(
+            await a.call_tool(
+                "startup_summary",
+                {"session_id": "alice", "working_dir": "/tmp/a", "role": "tester"},
+            )
+        )
+    assert "alice" in result["status"]
+    assert result["pending_messages"] == []
+    sessions = result["sessions"]
+    assert isinstance(sessions, list)
+    assert any(s["session_id"] == "alice" for s in sessions)
+
+
+@pytest.mark.asyncio
+async def test_startup_summary_compact_default(broker_url: str) -> None:
+    """startup_summary defaults to compact=True — no working_dir in session list."""
+    async with _client(broker_url) as a:
+        result = _payload(
+            await a.call_tool(
+                "startup_summary",
+                {"session_id": "alice", "working_dir": "/tmp/a"},
+            )
+        )
+    for s in result["sessions"]:
+        assert "working_dir" not in s
+        assert "session_id" in s
+        assert "role" in s
+
+
+@pytest.mark.asyncio
+async def test_startup_summary_full_shape_when_compact_false(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        result = _payload(
+            await a.call_tool(
+                "startup_summary",
+                {"session_id": "alice", "working_dir": "/tmp/a", "compact": False},
+            )
+        )
+    alice = next(s for s in result["sessions"] if s["session_id"] == "alice")
+    assert "working_dir" in alice
+
+
+@pytest.mark.asyncio
+async def test_startup_summary_returns_backlog(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "queued"}
+        )
+    async with _client(broker_url) as b:
+        result = _payload(
+            await b.call_tool(
+                "startup_summary",
+                {"session_id": "bob", "working_dir": "/tmp/b"},
+            )
+        )
+    assert len(result["pending_messages"]) == 1
+    assert _msg_core(result["pending_messages"][0]) == {"from": "alice", "message": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# receive_messages fields selector
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_receive_messages_fields_selector(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "hello"}
+        )
+        msgs = _payload(
+            await a.call_tool(
+                "receive_messages",
+                {"session_id": "bob", "fields": ["from", "message"]},
+            )
+        )
+    assert len(msgs) == 1
+    assert msgs[0] == {"from": "alice", "message": "hello"}
+    # sent_at_iso should be stripped
+    assert "sent_at_iso" not in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_receive_messages_fields_none_returns_all(broker_url: str) -> None:
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message", {"to": "bob", "from_session": "alice", "message": "hello"}
+        )
+        msgs = _payload(
+            await a.call_tool("receive_messages", {"session_id": "bob"})
+        )
+    assert "sent_at_iso" in msgs[0]

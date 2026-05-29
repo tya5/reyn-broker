@@ -2,6 +2,36 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.9.0] - 2026-05-30
+
+### Added
+- **`startup_summary` tool** — registers a session and returns the peer list in
+  one round-trip, replacing the common `register_session` + `list_sessions`
+  startup pattern. Defaults to `compact=True` for the session list.
+- **`list_sessions(compact=True)`** — compact mode returns only `session_id` and
+  `role`, ~60 % fewer tokens than the full shape. Full shape (activity timestamps,
+  `inbox_unread_count`) still available with `compact=False` (default kept for
+  backward compatibility).
+- **`receive_messages(fields=[...])`** — optional field selector. Pass e.g.
+  `fields=["from","message"]` to strip `sent_at_iso`, `is_broadcast`, and
+  `recipient_count` from returned messages, reducing token overhead for callers
+  that do not need metadata.
+- **SESSION_GUIDE §5.9 token-saving guidelines** — documents `startup_summary`,
+  `compact=True`, field selector, and call-frequency best practices.
+
+### Changed
+- `register_session` and `list_sessions` internals factored into
+  `_register_locked` / `_session_list_locked` helpers (shared with
+  `startup_summary`).
+- `list_sessions` `inbox_unread_count` now applies `_purge_expired` before
+  counting, so expired messages are not reflected in the count.
+
+### ⚠️ Schema change notice
+`list_sessions` gained a `compact` parameter; `receive_messages` gained a
+`fields` parameter; `startup_summary` is new. Sessions started against v0.8.0
+or earlier should run `ToolSearch` to refresh schemas or restart their Claude
+Code session.
+
 ## [0.8.0] - 2026-05-28
 
 ### Added
@@ -137,6 +167,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - pytest integration tests, ruff lint, GitHub Actions CI on 3.10 / 3.11
   / 3.12 matrix.
 
+[0.9.0]: https://github.com/tya5/reyn-broker/releases/tag/0.9.0
 [0.8.0]: https://github.com/tya5/reyn-broker/releases/tag/0.8.0
 [0.7.0]: https://github.com/tya5/reyn-broker/releases/tag/0.7.0
 [0.6.0]: https://github.com/tya5/reyn-broker/releases/tag/0.6.0
