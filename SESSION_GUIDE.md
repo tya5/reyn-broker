@@ -153,6 +153,28 @@ broker (v0.3.0+) は sessions メタデータ + pending キューを disk に永
 - watcher (Monitor task) は broker 接続が一時切断 → 自動 retry → 復活するので透過。 fallback として手動 `receive_messages` も使える
 - 「broker restart した」 と user / 他 session から通知されても、 **再 `register_session` は不要** (= 必要なら自分の判断で role 更新したい時だけ呼ぶ)
 
+### ⚠️ watcher の health check 義務
+
+broker restart announce を受けたら、**必ず自 session の watcher (Monitor task) が生きているかを確認すること**。
+
+broker 接続切断中に Monitor task が何らかの理由で kill されていた場合、自動 retry は起きず inbox が蓄積し続ける silent stall になる。
+
+**確認手順**:
+```
+TaskList()  # watcher task が running か確認
+```
+- running でない場合 → 即 watcher 再起動:
+  ```
+  Monitor(
+    command="/path/to/broker/.venv/bin/python /path/to/broker/session_watcher.py --session=<id>",
+    persistent=True,
+    timeout_ms=3600000,
+  )
+  ```
+- running でも念のため `receive_messages` を手動 drain して蓄積確認
+
+broker からの restart 完了 announce には必ず「watcher health check をしてください」という文言が含まれます。
+
 ### ⚠️ ツールスキーマキャッシュ問題
 
 Claude Code は MCP サーバーのツール一覧を **セッション起動時に一度だけ取得してキャッシュ** する。broker が新バージョンで再起動してツールのシグネチャが変わった場合、接続中のセッションは古いスキーマを持ち続ける。
