@@ -64,6 +64,23 @@ listening broker *and* any clients connected to that port (including the
 `session_watcher.py` polling processes), so it kills your watchers too.
 Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 
+### After a broker restart
+
+- **State** (registered sessions, roles, pending messages) survives restart automatically via
+  the state file. Sessions do not need to re-call `register_session`.
+- **`session_watcher.py`** reconnects automatically on its next poll cycle (within
+  `ERROR_BACKOFF_S` seconds, default 10 s). No watcher restart needed.
+- **MCP tool schema cache** — Claude Code fetches each MCP server's tool list once at
+  session startup and caches it. If the broker is restarted with a new version that
+  changes a tool's signature (added/removed parameters), connected sessions will still
+  hold the old schema. Symptoms: `receive_messages` works but `post_message` (or another
+  changed tool) fails.
+  **Fix:** run `ToolSearch(query="select:mcp__broker__post_message")` in the affected
+  session to force a schema refresh. If that does not help, restart the Claude Code
+  session to re-initialize the MCP connection from scratch.
+  **Prevention:** broker releases that change tool signatures are noted in CHANGELOG as
+  requiring a session-side schema refresh.
+
 ## MCP tools
 
 | Tool                | Args                                            | Effect                                                                          |

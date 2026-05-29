@@ -28,6 +28,17 @@ All notable changes to reyn-broker are documented in this file.
   `python3` will fail with `ModuleNotFoundError: No module named 'mcp'`.
 - `SESSION_GUIDE.md` — truncated notification handling updated to document the
   new `_preview` field.
+- `README.md` / `SESSION_GUIDE.md` — documented MCP tool schema cache behaviour
+  after broker restart: `post_message` signature changed (added `recipients`,
+  `ttl_seconds`), so sessions started against an older broker will hold a stale
+  schema. Fix: `ToolSearch(query="select:mcp__broker__post_message")` to refresh,
+  or restart the Claude Code session.
+
+### ⚠️ Schema change notice
+`post_message` gained two new optional parameters (`recipients`, `ttl_seconds`).
+Claude Code sessions that were running before this restart may see tool-call
+failures on `post_message`. Run `ToolSearch` to refresh the schema or restart
+the session.
 
 ## [0.7.0] - 2026-05-28
 

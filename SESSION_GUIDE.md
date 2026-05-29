@@ -153,6 +153,22 @@ broker (v0.3.0+) は sessions メタデータ + pending キューを disk に永
 - watcher (Monitor task) は broker 接続が一時切断 → 自動 retry → 復活するので透過。 fallback として手動 `receive_messages` も使える
 - 「broker restart した」 と user / 他 session から通知されても、 **再 `register_session` は不要** (= 必要なら自分の判断で role 更新したい時だけ呼ぶ)
 
+### ⚠️ ツールスキーマキャッシュ問題
+
+Claude Code は MCP サーバーのツール一覧を **セッション起動時に一度だけ取得してキャッシュ** する。broker が新バージョンで再起動してツールのシグネチャが変わった場合、接続中のセッションは古いスキーマを持ち続ける。
+
+**症状**: `receive_messages` は動くのに `post_message` など変更されたツールが失敗する。
+
+**対処手順**:
+1. まず ToolSearch でスキーマを再取得:
+   ```
+   ToolSearch(query="select:mcp__broker__post_message")
+   ```
+   取得したスキーマで再度ツールを呼び出す。
+2. それでも失敗する場合 → Claude Code **セッション再起動**（MCP 接続がリセットされ最新スキーマを取得）
+
+**予防**: CHANGELOG でツールシグネチャの変更がある release は「セッション側スキーマ更新が必要」と明記する。
+
 ---
 
 ## 6. 利用可能なツール早見表
