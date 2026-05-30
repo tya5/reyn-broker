@@ -9,7 +9,8 @@ when the Claude Code session is otherwise idle.
 
 Usage (typically as a Monitor command):
 
-    /path/to/broker/.venv/bin/python /path/to/broker/session_watcher.py --session=<id>
+    /path/to/broker/.venv/bin/python /path/to/broker/session_watcher.py \
+        --session=<id> [--fields from,message]
 
 IMPORTANT: run with the broker's own virtualenv Python so that the ``mcp``
 package is available. Using the system ``python3`` will fail with
@@ -191,8 +192,11 @@ def _parse_messages(call_result) -> list[dict]:
     return msgs
 
 
-async def _poll_loop(session_id: str) -> None:
+async def _poll_loop(session_id: str, fields: list[str] | None) -> None:
     consecutive_errors = 0
+    call_args: dict = {"session_id": session_id}
+    if fields is not None:
+        call_args["fields"] = fields
     while True:
         try:
             async with (
@@ -202,10 +206,7 @@ async def _poll_loop(session_id: str) -> None:
                 await cs.initialize()
                 consecutive_errors = 0
                 while True:
-                    result = await cs.call_tool(
-                        "receive_messages",
-                        {"session_id": session_id},
-                    )
+                    result = await cs.call_tool("receive_messages", call_args)
                     for msg in _parse_messages(result):
                         _emit_message(session_id, msg)
                     await asyncio.sleep(POLL_S)
@@ -226,9 +227,19 @@ def main() -> int:
         description="Poll broker inbox and emit each new message as a stdout line."
     )
     parser.add_argument("--session", required=True, help="Your session_id (= basename of cwd)")
+    parser.add_argument(
+        "--fields",
+        default=None,
+        help=(
+            "Comma-separated list of message fields to request from broker "
+            "(e.g. 'from,message'). Omitting metadata fields reduces token overhead. "
+            "Default: all fields."
+        ),
+    )
     args = parser.parse_args()
+    fields = [f.strip() for f in args.fields.split(",")] if args.fields else None
     try:
-        asyncio.run(_poll_loop(args.session))
+        asyncio.run(_poll_loop(args.session, fields))
     except KeyboardInterrupt:
         return 130
     return 0

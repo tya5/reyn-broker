@@ -28,6 +28,7 @@ logger = logging.getLogger("broker")
 
 _VERSION = "0.10.0"
 _STARTED_AT_TS: float = time.time()
+_tool_call_counts: dict[str, int] = defaultdict(int)
 
 
 def _now_iso() -> str:
@@ -272,6 +273,7 @@ async def register_session(
     Prefer ``startup_summary`` at startup to combine this call with
     ``list_sessions`` in one round-trip.
     """
+    _tool_call_counts["register_session"] += 1
     async with registry_lock:
         status, backlog = _register_locked(session_id, working_dir, ctx.session, role, ttl_hours)
         _save_state()
@@ -306,6 +308,7 @@ async def startup_summary(
     Using this instead of two separate calls reduces MCP tool invocations
     and the token overhead of two tool results in context.
     """
+    _tool_call_counts["startup_summary"] += 1
     async with registry_lock:
         status, backlog = _register_locked(session_id, working_dir, ctx.session, role, ttl_hours)
         session_list = _session_list_locked(compact)
@@ -317,6 +320,7 @@ async def startup_summary(
 @mcp.tool()
 async def unregister_session(session_id: str) -> str:
     """Unregister a session from the broker."""
+    _tool_call_counts["unregister_session"] += 1
     async with registry_lock:
         existed = sessions.pop(session_id, None)
         if existed is not None:
@@ -341,6 +345,7 @@ async def list_sessions(compact: bool = False) -> list[dict[str, Any]]:
     Tip: at startup use ``startup_summary`` instead — it combines
     ``register_session`` + ``list_sessions`` into one round-trip.
     """
+    _tool_call_counts["list_sessions"] += 1
     async with registry_lock:
         return _session_list_locked(compact)
 
@@ -381,6 +386,7 @@ async def post_message(
     time-sensitive coordination signals where a stale message would cause
     confusion (e.g. "deploy window open for the next 5 minutes").
     """
+    _tool_call_counts["post_message"] += 1
     sent_at = _now_iso()
     targets = recipients if recipients is not None else [to]
 
@@ -439,6 +445,7 @@ async def broadcast_message(
     registered) receive the message. ``exclude_self`` still applies.
     When omitted all registered sessions receive the message.
     """
+    _tool_call_counts["broadcast_message"] += 1
     sent_at = _now_iso()
     payload: dict[str, Any] = {
         "from": from_session,
@@ -491,6 +498,7 @@ async def receive_messages(
     can significantly reduce token overhead when those fields are not
     needed.  Defaults to ``None`` (all fields returned).
     """
+    _tool_call_counts["receive_messages"] += 1
     async with registry_lock:
         msgs = _drain_inbox_locked(session_id)
         if msgs:
@@ -509,6 +517,7 @@ async def inbox_stats(session_id: str) -> dict[str, Any]:
     has not raced ahead of the caller, or for "have I been heard?"
     diagnostics. Does NOT remove messages from the queue.
     """
+    _tool_call_counts["inbox_stats"] += 1
     async with registry_lock:
         msgs = _purge_expired(pending.get(session_id, []))
         senders = sorted({str(m.get("from", "unknown")) for m in msgs})
@@ -540,6 +549,7 @@ async def peek_messages(
     than just counts and senders.  Unlike ``receive_messages``, the messages
     stay in the queue after this call.
     """
+    _tool_call_counts["peek_messages"] += 1
     async with registry_lock:
         msgs = _purge_expired(pending.get(session_id, []))
     result = [_strip_internal(m) for m in msgs[:limit]]
@@ -563,6 +573,7 @@ async def health_check() -> dict[str, Any]:
     - ``session_count`` — number of currently registered sessions.
     - ``total_pending`` — total messages queued across all inboxes.
     """
+    _tool_call_counts["health_check"] += 1
     async with registry_lock:
         sc = len(sessions)
         tp = sum(len(v) for v in pending.values())
@@ -572,6 +583,27 @@ async def health_check() -> dict[str, Any]:
         "uptime_seconds": int(time.time() - _STARTED_AT_TS),
         "session_count": sc,
         "total_pending": tp,
+    }
+
+
+@mcp.tool()
+async def tool_stats() -> dict[str, Any]:
+    """Return per-tool call counts since broker startup.
+
+    Useful for identifying which tools are called most frequently so you
+    can prioritise token-reduction efforts. Counts reset on broker restart.
+
+    Returns a dict with:
+    - ``counts`` — mapping of tool name → call count, sorted by count desc.
+    - ``total_calls`` — sum of all tool invocations.
+    - ``uptime_seconds`` — seconds since broker started (for normalisation).
+    """
+    _tool_call_counts["tool_stats"] += 1
+    counts = dict(sorted(_tool_call_counts.items(), key=lambda x: x[1], reverse=True))
+    return {
+        "counts": counts,
+        "total_calls": sum(counts.values()),
+        "uptime_seconds": int(time.time() - _STARTED_AT_TS),
     }
 
 

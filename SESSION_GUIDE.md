@@ -157,35 +157,46 @@ post_message(
 
 ---
 
-## 4. メッセージを受け取る (ポーリング方式)
+## 4. メッセージを受け取る
 
-**重要:** broker は logging notification (`notifications/message`) も
-ベストエフォートで投げるが、Claude Code の MCP クライアントは log 通知を
-LLM のコンテキストに自動投入しない。つまり通知だけでは届かない。
-**必ず `receive_messages` を能動的に呼んで inbox を回収すること。**
+### watcher 稼働中（通常運用）
+
+**watcher (session_watcher.py Monitor) が稼働中であれば `receive_messages` を自分で呼んではいけない。**
+
+watcher がすでに 30 秒毎に inbox を drain しており、届いたメッセージは
+`<task-notification>` として自動でコンテキストに届く。
+`receive_messages` を追加で呼ぶと空のリストが返るだけで **MCP 呼び出しのトークンコストだけ発生する**。
+
+watcher 稼働中に `receive_messages` を呼んでよいのは以下のみ:
+
+| 状況 | 理由 |
+|---|---|
+| `startup_summary` 直後の初回 backlog | watcher 起動前なので `pending_messages` を確認 |
+| watcher が落ちていたと判明した直後 | watcher の silent stall 中に溜まった backlog を回収 |
+| ユーザーから「今すぐ inbox 確認して」と言われた | 次の 30 秒 poll を待てない緊急確認 |
 
 ```
+# watcher 稼働中はこれを毎ターン呼んではいけない（トークン無駄）
 receive_messages(session_id="<自分の session_id>")
+```
+
+受信した通知（`<task-notification>`）の処理:
+
+1. event body を行単位で split、各行を 1 message として JSON parse
+2. `_truncated: true` なら `_preview` で概要確認 → 必要なら `_full_path` を Read
+3. 依頼内容のタスクを実行
+4. 完了したら `post_message(to=data.from, from_session=自分, message=結果)` で返信
+
+### watcher が落ちている場合（フォールバック）
+
+```
+# watcher が死んでいる場合のみ手動 drain
+receive_messages(session_id="<自分の session_id>", fields=["from", "message"])
 → [{"from": "<送信元>", "message": "<本文>"}, ...]
 ```
 
-返ってきた配列は inbox から削除済み(一度きりの引き渡し)。空配列なら
-未読なし。
-
-呼び出すタイミング:
-
-1. `register_session` 直後の `pending_messages` 確認(初回 backlog)
-2. ユーザーから「inbox 見て」「メッセージ来てない?」と頼まれたとき
-3. 長めのタスクが一段落したとき(自分が手元の作業を区切ったタイミング)
-4. 自分が `post_message` で誰かに依頼を投げた直後、相手の返信待ち時
-
-受信したら:
-
-1. 配列の各要素について `data.from` と `data.message` を読む
-2. 依頼内容のタスクを実行する
-3. 完了したら結果を `post_message(to=data.from, from_session=自分,
-   message=結果)` で返す
-4. 必要なら成果物パスや作業ログも本文に含める
+返ってきた配列は inbox から削除済み。空配列なら未読なし。
+`fields=["from","message"]` で metadata を省いてトークン削減すること。
 
 依頼が曖昧なら、エラー扱いせず `post_message` で質問を返す。
 
