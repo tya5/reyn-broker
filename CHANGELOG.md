@@ -2,6 +2,44 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.10.0] - 2026-05-30
+
+### Added
+- **`health_check()` tool** — returns `version`, `started_at_iso`, `uptime_seconds`,
+  `session_count`, and `total_pending`. Useful for smoke-testing after a broker
+  restart and for confirming which version is running before refreshing tool schemas.
+  Closes #8.
+- **`peek_messages(session_id, limit=10, fields=None)` tool** — non-destructive content
+  preview. Returns up to `limit` messages from the inbox without draining them, so
+  callers can make triage decisions without triggering read-acks or clearing the queue.
+  Supports the same `fields` selector as `receive_messages`.
+- **`broadcast_message(recipients=[...])` subset filter** — new optional `recipients`
+  parameter. When provided, the broadcast is limited to that subset of registered
+  sessions. Unregistered ids in the list are silently skipped. `exclude_self` still
+  applies. Omitting `recipients` keeps the existing all-sessions behaviour.
+- **Session TTL** — new optional `ttl_hours: float` parameter on `register_session`
+  and `startup_summary`. When set, the broker records a `session_expires_at` epoch
+  on the entry and the background purge task will automatically remove it after that
+  many hours. Useful for short-lived task sessions that may not call
+  `unregister_session` before exiting. TTL survives broker restarts (persisted to
+  state file).
+- **Background purge task** — a background asyncio task (via FastMCP lifespan) runs
+  every 5 minutes and purges both expired messages (existing behaviour, now also
+  proactive) and expired sessions (new). Previously, expired messages were only
+  removed lazily on next drain or `inbox_stats` call.
+
+### Changed
+- `_register_locked` now accepts a `ttl_hours` argument; callers that omit it get
+  the same `session_expires_at=None` (no TTL) behaviour as before.
+- `_save_state` / `_load_state` persist the new `session_expires_at` field.
+  State files from v0.9.0 load cleanly — the field defaults to `None` when absent.
+
+### ⚠️ Schema change notice
+Five tools changed or were added: `register_session` and `startup_summary` gained
+`ttl_hours`; `broadcast_message` gained `recipients`; `health_check` and
+`peek_messages` are new. Sessions started against v0.9.0 or earlier should run
+`ToolSearch` to refresh schemas or restart their Claude Code session.
+
 ## [0.9.0] - 2026-05-30
 
 ### Added
@@ -167,6 +205,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - pytest integration tests, ruff lint, GitHub Actions CI on 3.10 / 3.11
   / 3.12 matrix.
 
+[0.10.0]: https://github.com/tya5/reyn-broker/releases/tag/0.10.0
 [0.9.0]: https://github.com/tya5/reyn-broker/releases/tag/0.9.0
 [0.8.0]: https://github.com/tya5/reyn-broker/releases/tag/0.8.0
 [0.7.0]: https://github.com/tya5/reyn-broker/releases/tag/0.7.0

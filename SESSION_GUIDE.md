@@ -190,6 +190,7 @@ Claude Code は MCP サーバーのツール一覧を **セッション起動時
 2. それでも失敗する場合 → Claude Code **セッション再起動**（MCP 接続がリセットされ最新スキーマを取得）
 
 **予防**: CHANGELOG でツールシグネチャの変更がある release は「セッション側スキーマ更新が必要」と明記する。
+再起動後は `health_check()` で version を確認し、schema 変更リリースなら ToolSearch でスキーマを更新すること。
 
 ---
 
@@ -241,19 +242,65 @@ receive_messages(session_id="self", fields=["from", "message"])
 
 `inbox_stats` は自分の inbox 確認に使わない。drain するつもりなら `receive_messages` を直接呼ぶ（2回呼ぶのは無駄）。`inbox_stats` の用途は「相手がまだ読んでいないか確認する」。
 
+### peek_messages — 割り込み判断に使う
+
+`receive_messages` を呼ぶと inbox が drain されて read-ack も発火する。
+まだ今のタスクを続けるべきか中断すべきか判断したい場合は、
+先に `peek_messages` で内容だけ確認してから drain するかを決める:
+
+```
+# ❌ drain してから判断（read-ack 発火・キュー消去が先行してしまう）
+msgs = receive_messages(session_id="self")
+
+# ✅ 内容を確認してから drain を判断
+preview = peek_messages(session_id="self", fields=["from", "message"])
+if <割り込み不要と判断>:
+    # 後で drain する
+else:
+    msgs = receive_messages(session_id="self")
+```
+
+ただし triage 後に必ず `receive_messages` を呼ぶこと。`peek` は消費しないので読み飛ばし防止にならない。
+
+### health_check — broker 再起動後に必ず確認
+
+broker 再起動後は最初に `health_check()` を呼んで version を確認し、
+CHANGELOG に schema 変更がある version への更新であれば `ToolSearch` でスキーマを更新する。
+
+```
+health = health_check()
+# → {"version": "0.10.0", "uptime_seconds": 5, ...}
+```
+
+### session TTL — 短命タスクには ttl_hours を設定
+
+明示的に `unregister_session` を呼ばずに終了する可能性があるセッション
+（単発タスク、CI bot 等）は `ttl_hours` を設定しておく。
+broker の background purge (5 分毎) が自動削除するので registry が汚染されない。
+
+```
+# 永続セッション (omit ttl_hours)
+startup_summary(session_id="lead-coder", working_dir=..., role="lead")
+
+# 短命タスク (auto-expire in 4 hours)
+startup_summary(session_id="temp-reviewer", working_dir=..., role="PR review", ttl_hours=4.0)
+```
+
 ---
 
 ## 6. 利用可能なツール早見表
 
 | ツール | 引数 | 用途 |
 |---|---|---|
-| `startup_summary` | `session_id`, `working_dir`, `role?`, `compact?` (default true) | **起動時推奨** — register + list を 1 回に統合。`pending_messages` + `sessions` を同時取得 |
-| `register_session` | `session_id`, `working_dir`, `role?` | register のみ（list 不要な場合）。戻り値の `pending_messages` を必ず処理 |
+| `startup_summary` | `session_id`, `working_dir`, `role?`, `compact?` (default true), `ttl_hours?` | **起動時推奨** — register + list を 1 回に統合。`pending_messages` + `sessions` を同時取得 |
+| `register_session` | `session_id`, `working_dir`, `role?`, `ttl_hours?` | register のみ（list 不要な場合）。`ttl_hours` で自動期限切れ。戻り値の `pending_messages` を必ず処理 |
 | `list_sessions` | `compact?` (default false) | 相手を探す。**原則 `compact=True` を使う**（session_id + role のみ） |
 | `post_message` | `to`, `from_session`, `message`, `request_read_ack?`, `recipients?`, `ttl_seconds?` | 依頼/返信を送る。`recipients=[...]` で複数宛先、`ttl_seconds` で自動期限切れ |
-| `broadcast_message` | `from_session`, `message`, `exclude_self?` (default true) | 全 registered session に一斉送信 |
+| `broadcast_message` | `from_session`, `message`, `exclude_self?` (default true), `recipients?` | 全 registered session に一斉送信。`recipients=[...]` で対象を絞れる |
 | `receive_messages` | `session_id`, `fields?` | 自分の inbox を drain。**`fields=["from","message"]` で不要な metadata を除いてトークン削減** |
+| `peek_messages` | `session_id`, `limit?` (default 10), `fields?` | **非破壊コンテンツ確認** — inbox を drain せず内容を確認。割り込み要否の triage に |
 | `inbox_stats` | `session_id` | 非破壊 peek: `{pending_count, senders}`。自分の確認より**相手の確認**に使う |
+| `health_check` | *(なし)* | broker の version / uptime / session_count / total_pending を返す。再起動後の確認に |
 | `unregister_session` | `session_id` | 終了前に 1 回 |
 
 ---

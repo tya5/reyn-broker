@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,9 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
+
+_VERSION = "0.10.0"
+_STARTED_AT_TS: float = time.time()
 
 
 def _now_iso() -> str:
@@ -38,6 +42,7 @@ class SessionEntry:
     role: str | None = None
     last_post_at: str | None = None
     last_receive_at: str | None = None
+    session_expires_at: float | None = None  # epoch timestamp; None = no TTL
 
 
 sessions: dict[str, SessionEntry] = {}
@@ -47,7 +52,41 @@ registry_lock = asyncio.Lock()
 _DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "reyn-broker" / "state.json"
 _STATE_PATH = Path(os.environ.get("BROKER_STATE_FILE", _DEFAULT_STATE_PATH))
 
-mcp = FastMCP("broker")
+
+async def _background_purge() -> None:
+    """Periodically purge expired messages and expired sessions (every 5 min)."""
+    while True:
+        await asyncio.sleep(300)
+        async with registry_lock:
+            # purge expired messages from all inboxes
+            for sid in list(pending.keys()):
+                pending[sid] = _purge_expired(pending[sid])
+                if not pending[sid]:
+                    del pending[sid]
+            # purge expired sessions
+            now = time.time()
+            expired = [
+                sid for sid, e in sessions.items()
+                if e.session_expires_at is not None and e.session_expires_at < now
+            ]
+            for sid in expired:
+                del sessions[sid]
+                logger.info("session TTL expired, removed: %s", sid)
+            if expired:
+                _save_state()
+
+
+@asynccontextmanager
+async def _lifespan(app: Any):
+    task = asyncio.create_task(_background_purge())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+mcp = FastMCP("broker", lifespan=_lifespan)
 
 
 def _save_state() -> None:
@@ -68,6 +107,7 @@ def _save_state() -> None:
                     "role": e.role,
                     "last_post_at": e.last_post_at,
                     "last_receive_at": e.last_receive_at,
+                    "session_expires_at": e.session_expires_at,
                 }
                 for e in sessions.values()
             ],
@@ -98,6 +138,7 @@ def _load_state() -> None:
             role=entry.get("role"),
             last_post_at=entry.get("last_post_at"),
             last_receive_at=entry.get("last_receive_at"),
+            session_expires_at=entry.get("session_expires_at"),
         )
     for sid, msgs in data.get("pending", {}).items():
         pending[sid].extend(msgs)
@@ -169,13 +210,18 @@ def _register_locked(
     working_dir: str,
     mcp_session: Any,
     role: str | None,
+    ttl_hours: float | None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Register a session and drain its inbox.  Caller MUST hold ``registry_lock``."""
+    session_expires_at: float | None = None
+    if ttl_hours is not None:
+        session_expires_at = time.time() + ttl_hours * 3600
     sessions[session_id] = SessionEntry(
         session_id=session_id,
         working_dir=working_dir,
         mcp_session=mcp_session,
         role=role,
+        session_expires_at=session_expires_at,
     )
     backlog = _drain_inbox_locked(session_id)
     return f"registered '{session_id}' at {working_dir}", backlog
@@ -207,6 +253,7 @@ async def register_session(
     working_dir: str,
     ctx: Context,
     role: str | None = None,
+    ttl_hours: float | None = None,
 ) -> dict[str, Any]:
     """Register this Claude Code session with the broker.
 
@@ -216,12 +263,17 @@ async def register_session(
     does (e.g. ``"PR review"``, ``"e2e tests"``) so peers can find you
     via ``list_sessions`` without guessing from naming conventions.
 
+    ``ttl_hours`` — optional session lifetime in hours. If set, the broker
+    will automatically remove this session after that many hours. Useful
+    for short-lived task sessions that may not call ``unregister_session``
+    before exiting. Omit for permanent sessions.
+
     Returns any messages that were queued while this session was offline.
     Prefer ``startup_summary`` at startup to combine this call with
     ``list_sessions`` in one round-trip.
     """
     async with registry_lock:
-        status, backlog = _register_locked(session_id, working_dir, ctx.session, role)
+        status, backlog = _register_locked(session_id, working_dir, ctx.session, role, ttl_hours)
         _save_state()
 
     return {"status": status, "pending_messages": backlog}
@@ -234,6 +286,7 @@ async def startup_summary(
     ctx: Context,
     role: str | None = None,
     compact: bool = True,
+    ttl_hours: float | None = None,
 ) -> dict[str, Any]:
     """Register this session and return the peer list in a single round-trip.
 
@@ -247,11 +300,14 @@ async def startup_summary(
       default (``session_id`` + ``role`` only).  Pass ``compact=False``
       for the full shape including activity timestamps.
 
+    ``ttl_hours`` — optional session lifetime in hours (same as
+    ``register_session``).
+
     Using this instead of two separate calls reduces MCP tool invocations
     and the token overhead of two tool results in context.
     """
     async with registry_lock:
-        status, backlog = _register_locked(session_id, working_dir, ctx.session, role)
+        status, backlog = _register_locked(session_id, working_dir, ctx.session, role, ttl_hours)
         session_list = _session_list_locked(compact)
         _save_state()
 
@@ -367,8 +423,9 @@ async def broadcast_message(
     from_session: str,
     message: str,
     exclude_self: bool = True,
+    recipients: list[str] | None = None,
 ) -> str:
-    """Queue ``message`` in every registered session's inbox.
+    """Queue ``message`` in every registered session's inbox (or a subset).
 
     Same semantics as ``post_message`` but addressed to all registered
     sessions at once. By default the sender's own inbox is skipped
@@ -376,6 +433,11 @@ async def broadcast_message(
     protocol changes) or "anyone available?" calls — the addressed-inbox
     model is preserved (each recipient drains its own inbox via
     ``receive_messages``).
+
+    ``recipients`` — optional list of session ids to limit the broadcast
+    to a specific subset. Only sessions in this list (and currently
+    registered) receive the message. ``exclude_self`` still applies.
+    When omitted all registered sessions receive the message.
     """
     sent_at = _now_iso()
     payload: dict[str, Any] = {
@@ -386,7 +448,13 @@ async def broadcast_message(
     }
 
     async with registry_lock:
-        targets = [sid for sid in sessions if not (exclude_self and sid == from_session)]
+        if recipients is not None:
+            targets = [
+                sid for sid in recipients
+                if sid in sessions and not (exclude_self and sid == from_session)
+            ]
+        else:
+            targets = [sid for sid in sessions if not (exclude_self and sid == from_session)]
         payload["recipient_count"] = len(targets)
         for sid in targets:
             pending[sid].append(payload)
@@ -449,6 +517,61 @@ async def inbox_stats(session_id: str) -> dict[str, Any]:
         "session_id": session_id,
         "pending_count": count,
         "senders": senders,
+    }
+
+
+@mcp.tool()
+async def peek_messages(
+    session_id: str,
+    limit: int = 10,
+    fields: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Preview queued messages without draining the inbox.
+
+    Returns the oldest ``limit`` messages (default 10) from ``session_id``'s
+    inbox without removing them. Useful for triage decisions (do I need to
+    interrupt my current task?) and debugging (what's actually in my inbox?)
+    without committing to a drain that triggers read-acks and clears the queue.
+
+    ``fields`` — optional key selector, same semantics as ``receive_messages``.
+    Pass e.g. ``["from", "message"]`` to strip metadata and reduce token cost.
+
+    Unlike ``inbox_stats``, ``peek_messages`` shows message content rather
+    than just counts and senders.  Unlike ``receive_messages``, the messages
+    stay in the queue after this call.
+    """
+    async with registry_lock:
+        msgs = _purge_expired(pending.get(session_id, []))
+    result = [_strip_internal(m) for m in msgs[:limit]]
+    if fields is not None:
+        result = [{k: v for k, v in m.items() if k in fields} for m in result]
+    return result
+
+
+@mcp.tool()
+async def health_check() -> dict[str, Any]:
+    """Return broker health and runtime statistics.
+
+    Useful for monitoring, smoke-testing after a broker restart, and
+    confirming which version is running before refreshing tool schemas.
+
+    Returns:
+    - ``version`` — broker version string.
+    - ``started_at_iso`` — ISO-8601 UTC timestamp of when the broker
+      process started.
+    - ``uptime_seconds`` — integer seconds since startup.
+    - ``session_count`` — number of currently registered sessions.
+    - ``total_pending`` — total messages queued across all inboxes.
+    """
+    async with registry_lock:
+        sc = len(sessions)
+        tp = sum(len(v) for v in pending.values())
+    return {
+        "version": _VERSION,
+        "started_at_iso": datetime.fromtimestamp(_STARTED_AT_TS, tz=timezone.utc).isoformat(),
+        "uptime_seconds": int(time.time() - _STARTED_AT_TS),
+        "session_count": sc,
+        "total_pending": tp,
     }
 
 

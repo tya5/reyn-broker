@@ -85,14 +85,16 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 
 | Tool                | Args                                            | Effect                                                                          |
 |---------------------|-------------------------------------------------|---------------------------------------------------------------------------------|
-| `register_session`  | `session_id`, `working_dir`, `role?` (optional) | Register this client. Returns `status` and `pending_messages` (drained backlog). |
+| `register_session`  | `session_id`, `working_dir`, `role?`, `ttl_hours?` | Register this client. Returns `status` and `pending_messages` (drained backlog). `ttl_hours` sets an auto-expiry for the session. |
 | `unregister_session`| `session_id`                                    | Remove from the registry.                                                       |
-| `startup_summary`   | `session_id`, `working_dir`, `role?`, `compact?` | Register + list in one round-trip. Returns `status`, `pending_messages`, and `sessions` (compact by default). |
+| `startup_summary`   | `session_id`, `working_dir`, `role?`, `compact?`, `ttl_hours?` | Register + list in one round-trip. Returns `status`, `pending_messages`, and `sessions` (compact by default). |
 | `list_sessions`     | `compact?`                                      | Return registered sessions. `compact=True` returns only `session_id`+`role` (~60% fewer tokens). Full shape includes activity timestamps. |
 | `post_message`      | `to`, `from_session`, `message`, `request_read_ack?`, `recipients?`, `ttl_seconds?` | Queue a message. `recipients=[...]` for multi-target; `ttl_seconds` for auto-expiry. |
-| `broadcast_message` | `from_session`, `message`, `exclude_self?`      | Queue the same message in every registered session's inbox (sender skipped by default). |
+| `broadcast_message` | `from_session`, `message`, `exclude_self?`, `recipients?` | Queue the same message in every registered session's inbox (sender skipped by default). `recipients=[...]` limits to a subset. |
 | `receive_messages`  | `session_id`, `fields?`                         | Drain and return the caller's inbox. `fields=["from","message"]` strips metadata to reduce token overhead. |
+| `peek_messages`     | `session_id`, `limit?`, `fields?`              | Non-destructive content preview: returns up to `limit` (default 10) messages without draining. Supports `fields` selector. |
 | `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
+| `health_check`      | *(none)*                                        | Returns `version`, `started_at_iso`, `uptime_seconds`, `session_count`, `total_pending`. |
 
 `role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so
 peers can find you via `list_sessions` without relying on naming conventions.
@@ -108,6 +110,16 @@ picking up #N", or "pause merge".
 `inbox_stats(session_id)` returns `{pending_count, senders}` without
 draining; useful for sanity-checking that a watcher has not raced ahead
 of the caller, or for "have I been heard?" diagnostics.
+
+`peek_messages(session_id, limit=10, fields=None)` returns the oldest
+`limit` messages from the inbox without consuming them. Use it to
+preview message content and make triage decisions (interrupt or finish
+current task first?) before committing to a `receive_messages` drain.
+
+`health_check()` returns `version`, `started_at_iso`, `uptime_seconds`,
+`session_count`, and `total_pending`. Run it after a broker restart to
+confirm which version is live before refreshing tool schemas in connected
+sessions.
 
 ## Client configuration
 
