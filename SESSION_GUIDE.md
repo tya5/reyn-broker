@@ -29,6 +29,15 @@
 
 ## 1. セッション開始時にやること
 
+> **⚡ TL;DR — 起動時に必ずこの3ステップを実行すること**
+> 1. `startup_summary` で登録 + peer 一覧取得
+> 2. `Monitor` で session_watcher を起動（非同期受信を有効化）
+> 3. `pending_messages` の内容を処理
+
+---
+
+### ステップ 1: startup_summary で登録
+
 **自分の識別子を決める** — このセッションの作業ディレクトリ名(basename)を
 そのまま `session_id` として使う。`working_dir` は作業ディレクトリの絶対パス。
 
@@ -37,38 +46,90 @@ session_id  = basename(pwd)
 working_dir = pwd  (絶対パス)
 ```
 
-その値で `register_session` を 1 回呼ぶ:
+`startup_summary` を 1 回呼ぶ（`register_session` + `list_sessions` を 1 回に統合）:
 
 ```
-register_session(
+startup_summary(
     session_id="<basename>",
     working_dir="<absolute_path>",
-    role="<短い役割説明>",   # optional, 例: "PR review", "e2e tests"
+    role="<短い役割説明>",   # 例: "PR review", "e2e tests"
 )
 → {
     "status": "registered '<basename>' at <path>",
-    "pending_messages": [ {"from": ..., "message": ...}, ... ]
+    "pending_messages": [ {"from": ..., "message": ...}, ... ],
+    "sessions": [ {"session_id": ..., "role": ...}, ... ]   # compact 形式
   }
 ```
 
 **戻り値の `pending_messages` を必ず確認する**。オフライン中に届いていた
-メッセージはすべてここに入っており、登録と同時に drain される
-(broker 側からは消える)。漏らさず読み、必要なら順番に処理すること。
+メッセージはすべてここに入っており、登録と同時に drain される。
+漏らさず読み、必要なら順番に処理すること。
 
-`role` は optional で、未指定なら `null` 扱い。 指定しておくと
-`list_sessions` の結果に含まれるので、 他セッションが session_id の
-命名規約を知らなくても役割を見て routing 判断できる。 freeform 1 行で OK
-(例: "PR review", "e2e tests", "TUI fixes")。
+`role` は optional。指定しておくと `list_sessions` の結果に含まれるので、
+他セッションが役割を見て routing 判断できる。freeform 1 行で OK。
+
+---
+
+### ステップ 2: session_watcher Monitor を起動（必須）
+
+**登録直後に必ず以下の Monitor を起動すること。** これを忘れると非同期受信が
+機能せず、メッセージを受け取るために都度 `receive_messages` を手動で呼ぶ必要
+が生じる（LLM トークンコストの無駄）。
+
+```
+Monitor(
+  description="broker inbox watcher (session=<自分の session_id>)",
+  command="/path/to/broker/.venv/bin/python /path/to/broker/session_watcher.py --session=<自分の session_id>",
+  persistent=True,
+  timeout_ms=3600000,
+)
+```
+
+> **⚠️ 重要: 必ず broker の `.venv/bin/python` を使うこと。**
+> 素の `python3` では `ModuleNotFoundError: No module named 'mcp'` で即落ちる。
+> パス例: `/Users/yasudatetsuya/Workspace/reyn_dev/broker/.venv/bin/python`
+
+Monitor 起動後、session_watcher が 30 秒毎に inbox をポーリングし、メッセージが
+届いたら `<task-notification>` として自動でコンテキストに届く。**アイドル中の
+ポーリングはトークンコストゼロ。**
+
+---
+
+### ステップ 3: pending_messages を処理
+
+`startup_summary` の戻り値に `pending_messages` があれば順番に処理する。
+処理後は送信元へ返信すること。
+
+---
+
+### broker restart 後の起動手順（Claude Code セッション再起動後）
+
+Claude Code セッションを再起動した場合、以下を追加で実施:
+
+```
+# 1. broker の version 確認（schema 変更があれば ToolSearch で更新）
+health_check()
+
+# 2. 新ツールの schema 取得（broker 更新後は必ず実行）
+ToolSearch(query="select:mcp__broker__health_check,mcp__broker__peek_messages,mcp__broker__startup_summary")
+
+# 3. watcher の TaskList 確認（セッション再起動で Monitor が消えているので再起動）
+TaskList()  # → 空なら Monitor を再起動（ステップ2参照）
+
+# 4. startup_summary で再登録（再登録不要なら receive_messages で残留確認）
+receive_messages(session_id="<自分の session_id>")
+```
 
 ---
 
 ## 2. 他セッションを探す
 
-固定のセッション名を仮定しない。実行時に必ず `list_sessions` で取得する:
+固定のセッション名を仮定しない。`startup_summary` の戻り値 `sessions` を使うか、
+改めて `list_sessions(compact=True)` を呼ぶ:
 
 ```
-list_sessions()
-→ [{"session_id": "...", "working_dir": "...", "role": "..." | null}, ...]
+list_sessions(compact=True)
+→ [{"session_id": "...", "role": "..." | null}, ...]
 ```
 
 返ってきた一覧から、目的に合いそうな `session_id` を選ぶ。判断順:
