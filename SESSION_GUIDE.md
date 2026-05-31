@@ -202,6 +202,46 @@ receive_messages(session_id="<自分の session_id>", fields=["from", "message"]
 
 ---
 
+## 4.5. MANDATORY notify-on-stop（必須プロトコル）
+
+> **⚠️ silent stop（status なしで turn 終了）= protocol 違反**
+
+turn を終える / 停止 / pause / blocked / hand-off / context 切れ が発生する場合、
+**停止前の最後のアクションとして必ず `backlog-watcher` へ stop-status を post すること**。
+
+### post 内容（3点セット）
+
+```
+post_message(
+    to="backlog-watcher",
+    from_session="<自分の session_id>",
+    message="""
+(a) 完了したこと: <直前のタスク完了状態>
+(b) 停止理由 + 次: done-need-review / blocked-on-<X> / pausing-resume-when-<Y> / handed-off-to-<Z>
+(c) WIP 状態: branch push 済? PR#? blocker?
+"""
+)
+```
+
+### 通知先の役割分担
+
+| 通知先 | 用途 |
+|---|---|
+| **backlog-watcher** | 停止 status（全ての stop-status はここへ）|
+| **lead-coder** | 緊急 review 依頼 / design decision / PR merge 依頼 |
+
+backlog-watcher が peer-status を集約し、actionable な stall / blocker のみ
+lead-coder に escalate する（lead-coder の noise 削減）。routine な status は
+backlog-watcher で留まる。
+
+### なぜ必須か
+
+broker は POST 時しか lead-coder / backlog-watcher に通知しない。無言停止 =
+監視側が盲目化し、silent stall を外部から検知できなくなる。
+mid-task で止まらざるを得ない時も「ここで一旦止まる、再開は〜」の一言で足りる。
+
+---
+
 ## 5. セッション終了時
 
 明示的にセッションを終わる前に呼ぶ:
