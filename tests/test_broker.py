@@ -979,7 +979,7 @@ async def test_session_ttl_expires_and_removed(broker_url: str) -> None:
 async def test_health_check_returns_expected_fields(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.10.0"
+    assert result["version"] == "0.12.0"
     assert isinstance(result["uptime_seconds"], int)
     assert result["uptime_seconds"] >= 0
     assert result["started_at_iso"].startswith("20")
@@ -1096,3 +1096,84 @@ async def test_peek_messages_strips_internal_fields(broker_url: str) -> None:
     assert len(peek) == 1
     assert "_expires_at" not in peek[0]
     assert "_ack_to" not in peek[0]
+
+
+# ---------------------------------------------------------------------------
+# BROKER_MONITOR_SESSION / monitoring copies (v0.12.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_session_receives_post_message_copy(broker_url_monitored: str) -> None:
+    """post_message copies arrive in the monitor session inbox."""
+    async with _client(broker_url_monitored) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {"to": "bob", "from_session": "alice", "message": "hello bob"},
+        )
+        monitor_msgs = _payload(
+            await a.call_tool("receive_messages", {"session_id": "monitor"})
+        )
+
+    assert len(monitor_msgs) == 1
+    assert monitor_msgs[0]["from"] == "alice"
+    assert monitor_msgs[0]["message"] == "hello bob"
+    assert monitor_msgs[0]["monitor_to"] == "bob"
+    # internal fields must not leak
+    assert "_ack_to" not in monitor_msgs[0]
+    assert "_expires_at" not in monitor_msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_monitor_session_receives_broadcast_copy(broker_url_monitored: str) -> None:
+    """broadcast_message copies arrive in the monitor session inbox."""
+    async with _client(broker_url_monitored) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        async with _client(broker_url_monitored) as b:
+            await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
+            await a.call_tool(
+                "broadcast_message",
+                {"from_session": "alice", "message": "all hands"},
+            )
+            monitor_msgs = _payload(
+                await a.call_tool("receive_messages", {"session_id": "monitor"})
+            )
+
+    assert len(monitor_msgs) == 1
+    assert monitor_msgs[0]["from"] == "alice"
+    assert monitor_msgs[0]["message"] == "all hands"
+    assert isinstance(monitor_msgs[0]["monitor_to"], list)
+
+
+@pytest.mark.asyncio
+async def test_monitor_session_not_duplicated_when_in_targets(broker_url_monitored: str) -> None:
+    """Monitor session does not get a copy when it is itself the target."""
+    async with _client(broker_url_monitored) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool(
+            "post_message",
+            {"to": "monitor", "from_session": "alice", "message": "direct to monitor"},
+        )
+        msgs = _payload(
+            await a.call_tool("receive_messages", {"session_id": "monitor"})
+        )
+
+    # Only one copy (the direct message), not two
+    assert len(msgs) == 1
+    assert "monitor_to" not in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_tool_stats_returns_counts(broker_url: str) -> None:
+    """tool_stats returns a counts dict with expected keys."""
+    async with _client(broker_url) as a:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await a.call_tool("list_sessions", {})
+        result = _payload(await a.call_tool("tool_stats", {}))
+    assert "counts" in result
+    assert "total_calls" in result
+    assert "uptime_seconds" in result
+    assert result["counts"].get("register_session", 0) >= 1
+    assert result["counts"].get("list_sessions", 0) >= 1
+    assert result["total_calls"] >= 3

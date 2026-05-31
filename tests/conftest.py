@@ -39,8 +39,12 @@ def _wait_for_port(port: int, timeout: float) -> None:
     raise RuntimeError(f"broker did not start listening on port {port} within {timeout}s")
 
 
-def _spawn_broker(port: int, state_file: Path) -> subprocess.Popen:
-    env = {**os.environ, "BROKER_STATE_FILE": str(state_file)}
+def _spawn_broker(
+    port: int,
+    state_file: Path,
+    extra_env: dict | None = None,
+) -> subprocess.Popen:
+    env = {**os.environ, "BROKER_STATE_FILE": str(state_file), **(extra_env or {})}
     proc = subprocess.Popen(
         [sys.executable, str(_SERVER_PY), "--port", str(port), "--log-level", "WARNING"],
         cwd=str(_BROKER_DIR),
@@ -67,6 +71,18 @@ def broker_url(tmp_path: Path) -> Iterator[str]:
     port = _free_port()
     state_file = tmp_path / "state.json"
     proc = _spawn_broker(port, state_file)
+    try:
+        yield f"http://127.0.0.1:{port}/mcp"
+    finally:
+        _stop_broker(proc)
+
+
+@pytest.fixture
+def broker_url_monitored(tmp_path: Path) -> Iterator[str]:
+    """Broker with BROKER_MONITOR_SESSION=monitor set."""
+    port = _free_port()
+    state_file = tmp_path / "state.json"
+    proc = _spawn_broker(port, state_file, extra_env={"BROKER_MONITOR_SESSION": "monitor"})
     try:
         yield f"http://127.0.0.1:{port}/mcp"
     finally:

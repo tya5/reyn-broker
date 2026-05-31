@@ -26,9 +26,12 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.10.0"
+_VERSION = "0.12.0"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
+# Optional session that receives a copy of every posted/broadcast message.
+# Set via BROKER_MONITOR_SESSION env var (e.g. "telegram").
+_MONITOR_SID: str | None = os.environ.get("BROKER_MONITOR_SESSION")
 
 
 def _now_iso() -> str:
@@ -409,6 +412,9 @@ async def post_message(
             (online if target in sessions else offline).append(target)
         if from_session in sessions:
             sessions[from_session].last_post_at = sent_at
+        if _MONITOR_SID and _MONITOR_SID not in targets and from_session != _MONITOR_SID:
+            monitor_to = targets[0] if len(targets) == 1 else targets
+            pending[_MONITOR_SID].append({**_strip_internal(payload), "monitor_to": monitor_to})
         _save_state()
 
     for target in online:
@@ -467,6 +473,8 @@ async def broadcast_message(
             pending[sid].append(payload)
         if from_session in sessions:
             sessions[from_session].last_post_at = sent_at
+        if _MONITOR_SID and _MONITOR_SID not in targets and from_session != _MONITOR_SID:
+            pending[_MONITOR_SID].append({**_strip_internal(payload), "monitor_to": targets})
         _save_state()
 
     for sid in targets:
