@@ -103,18 +103,64 @@ async def _tg(method: str, payload: dict | None = None, **params: Any) -> Any:
     return await asyncio.to_thread(_tg_call_sync, method, payload, params or None)
 
 
-async def send(text: str) -> None:
+async def send(text: str, keyboard: dict | None = None) -> None:
     """Send a Markdown message to the configured Telegram chat."""
     if not text.strip():
         return
+    payload: dict = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = keyboard
     try:
-        await _tg("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
+        await _tg("sendMessage", payload)
     except Exception:
         # Fallback: retry without Markdown in case of parse error
         try:
-            await _tg("sendMessage", {"chat_id": CHAT_ID, "text": text})
+            plain: dict = {"chat_id": CHAT_ID, "text": text}
+            if keyboard:
+                plain["reply_markup"] = keyboard
+            await _tg("sendMessage", plain)
         except Exception as exc2:
             print(f"[telegram-bridge] send failed: {exc2}", file=sys.stderr)
+
+
+async def answer_callback(callback_id: str, text: str = "") -> None:
+    """Acknowledge an inline keyboard button tap (required by Telegram)."""
+    import contextlib
+    with contextlib.suppress(Exception):
+        await _tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+def _session_keyboard(sessions: list[dict]) -> dict:
+    """Build an InlineKeyboardMarkup from a session list."""
+    buttons = []
+    for s in sessions:
+        sid = s["session_id"]
+        label = sid if not s.get("role") else f"{sid} ({s['role'][:20]})"
+        buttons.append([{"text": label, "callback_data": f"select:{sid}"}])
+    return {"inline_keyboard": buttons}
+
+
+def _reply_keyboard(sessions: list[dict]) -> dict:
+    """Build a persistent ReplyKeyboardMarkup with session names + utility buttons."""
+    # Session buttons (up to 2 per row)
+    sids = [s["session_id"] for s in sessions if s["session_id"] != BRIDGE_SID]
+    rows = [[{"text": sids[i]}, {"text": sids[i + 1]}] if i + 1 < len(sids)
+            else [{"text": sids[i]}]
+            for i in range(0, len(sids), 2)]
+    # Utility row at bottom
+    rows.append([{"text": "📋 一覧更新"}, {"text": "📊 Stats"}, {"text": "📡 Broadcast"}])
+    return {"keyboard": rows, "resize_keyboard": True, "persistent": True}
+
+
+async def show_home(cs: ClientSession, state: dict) -> None:
+    """Show the persistent session-picker keyboard."""
+    sessions = _parse_result(await cs.call_tool("list_sessions", {"compact": True}))
+    if not sessions:
+        await send("セッションが登録されていません。")
+        return
+    current = state.get("last_session")
+    label = f"現在の送信先: `{current}`" if current else "送信先を選んでください："
+    await send(label, keyboard=_reply_keyboard(sessions))
 
 
 # ---------------------------------------------------------------------------
@@ -141,62 +187,25 @@ def _parse_result(result: Any) -> Any:
 # Telegram → broker command handling
 # ---------------------------------------------------------------------------
 
+async def _send_to_session(target: str, text: str, cs: ClientSession) -> None:
+    result = _parse_result(await cs.call_tool("post_message", {
+        "to": target,
+        "from_session": BRIDGE_SID,
+        "message": text,
+    }))
+    await send(f"✉️ → `{target}`: {result}")
+
+
 async def handle_command(text: str, cs: ClientSession, state: dict) -> None:
     """Parse a Telegram message and call the appropriate broker tool."""
     text = text.strip()
 
-    if text.startswith("/help") or text == "/start":
-        await send(
-            "*reyn\\-broker Telegram bridge*\n\n"
-            "`/list` — registered sessions\n"
-            "`/send <session> <msg>` — post to a session\n"
-            "`/broadcast <msg>` — broadcast to all sessions\n"
-            "`/stats` — broker health \\+ call counts\n"
-            "`/help` — this message\n\n"
-            "Plain text → forwarded to last `/send` target\\."
-        )
+    # --- Utility buttons from ReplyKeyboard ---
+    if text == "📋 一覧更新":
+        await show_home(cs, state)
         return
 
-    if text.startswith("/list"):
-        result = _parse_result(await cs.call_tool("list_sessions", {"compact": True}))
-        if not result:
-            await send("No sessions registered.")
-            return
-        lines = "\n".join(
-            f"• `{s['session_id']}`" + (f" — {s['role']}" if s.get("role") else "")
-            for s in result
-        )
-        await send(f"*Registered sessions:*\n{lines}")
-        return
-
-    if text.startswith("/send "):
-        parts = text[6:].strip().split(" ", 1)
-        if len(parts) < 2:
-            await send("Usage: `/send <session_id> <message>`")
-            return
-        target, message = parts[0], parts[1]
-        state["last_session"] = target
-        result = _parse_result(await cs.call_tool("post_message", {
-            "to": target,
-            "from_session": BRIDGE_SID,
-            "message": message,
-        }))
-        await send(f"✉️ {result}")
-        return
-
-    if text.startswith("/broadcast "):
-        message = text[11:].strip()
-        if not message:
-            await send("Usage: `/broadcast <message>`")
-            return
-        result = _parse_result(await cs.call_tool("broadcast_message", {
-            "from_session": BRIDGE_SID,
-            "message": message,
-        }))
-        await send(f"📡 {result}")
-        return
-
-    if text.startswith("/stats"):
+    if text == "📊 Stats":
         health = _parse_result(await cs.call_tool("health_check", {}))
         stats_section = ""
         try:
@@ -216,23 +225,83 @@ async def handle_command(text: str, cs: ClientSession, state: dict) -> None:
         )
         return
 
-    if text.startswith("/"):
-        await send(f"Unknown command: `{text.split()[0]}`\nTry `/help`.")
+    if text == "📡 Broadcast":
+        state["_mode"] = "broadcast"
+        await send("broadcast するメッセージを入力してください：")
         return
 
-    # Plain text → forward to last known session
-    last = state.get("last_session")
-    if not last:
-        await send(
-            "No active session\\. Use `/send <session\\_id> <message>` first\\."
-        )
+    # --- Slash commands ---
+    if text.startswith("/help") or text == "/start":
+        await show_home(cs, state)
         return
-    result = _parse_result(await cs.call_tool("post_message", {
-        "to": last,
-        "from_session": BRIDGE_SID,
-        "message": text,
-    }))
-    await send(f"✉️ → `{last}`: {result}")
+
+    if text.startswith("/list"):
+        await show_home(cs, state)
+        return
+
+    if text.startswith("/send "):
+        parts = text[6:].strip().split(" ", 1)
+        if len(parts) < 2:
+            await send("Usage: `/send <session_id> <message>`")
+            return
+        target, message = parts[0], parts[1]
+        state["last_session"] = target
+        await _send_to_session(target, message, cs)
+        return
+
+    if text.startswith("/broadcast "):
+        message = text[11:].strip()
+        if not message:
+            await send("Usage: `/broadcast <message>`")
+            return
+        result = _parse_result(await cs.call_tool("broadcast_message", {
+            "from_session": BRIDGE_SID,
+            "message": message,
+        }))
+        await send(f"📡 {result}")
+        return
+
+    if text.startswith("/stats"):
+        await handle_command("📊 Stats", cs, state)
+        return
+
+    if text.startswith("/"):
+        await send(f"Unknown command: `{text.split()[0]}`")
+        return
+
+    # --- Plain text ---
+
+    # broadcast モード
+    if state.pop("_mode", None) == "broadcast":
+        result = _parse_result(await cs.call_tool("broadcast_message", {
+            "from_session": BRIDGE_SID,
+            "message": text,
+        }))
+        await send(f"📡 {result}")
+        return
+
+    # セッションIDと一致するボタンタップ → 送信先選択
+    sessions = _parse_result(await cs.call_tool("list_sessions", {"compact": True}))
+    session_ids = {s["session_id"] for s in (sessions or [])}
+    if text in session_ids:
+        state["last_session"] = text
+        # 保留メッセージがあれば送信
+        pending_text = state.pop("_pending_text", None)
+        if pending_text:
+            await _send_to_session(text, pending_text, cs)
+        else:
+            await send(f"✅ 送信先: `{text}`\nメッセージを入力してください。")
+        return
+
+    # 送信先が設定済みならそのまま転送
+    last = state.get("last_session")
+    if last:
+        await _send_to_session(last, text, cs)
+        return
+
+    # 送信先未設定 → ピッカー表示してテキストを保留
+    state["_pending_text"] = text
+    await send("送信先を選んでください：", keyboard=_session_keyboard(sessions or []))
 
 
 # ---------------------------------------------------------------------------
@@ -240,22 +309,43 @@ async def handle_command(text: str, cs: ClientSession, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def telegram_loop(cs: ClientSession, state: dict) -> None:
-    """Long-poll Telegram for new messages and dispatch to broker."""
+    """Long-poll Telegram for new messages and callback queries."""
     offset = 0
+    allowed = ["message", "callback_query"]
     while True:
         try:
             data = await asyncio.to_thread(
                 _tg_call_sync,
                 "getUpdates",
                 None,
-                {"offset": offset, "timeout": _TG_LONG_POLL, "allowed_updates": ["message"]},
+                {"offset": offset, "timeout": _TG_LONG_POLL, "allowed_updates": allowed},
             )
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
+
+                # Inline keyboard button tap
+                cb = update.get("callback_query")
+                if cb:
+                    cb_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    if cb_chat_id != CHAT_ID:
+                        continue
+                    data_str = cb.get("data", "")
+                    await answer_callback(cb["id"])
+                    if data_str.startswith("select:"):
+                        sid = data_str[7:]
+                        state["last_session"] = sid
+                        pending_text = state.pop("_pending_text", None)
+                        if pending_text:
+                            await _send_to_session(sid, pending_text, cs)
+                        else:
+                            await send(f"✅ 送信先: `{sid}`\nメッセージを入力してください。")
+                    continue
+
+                # Regular text message
                 msg = update.get("message", {})
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != CHAT_ID:
-                    continue  # ignore messages from other chats / groups
+                    continue
                 text = msg.get("text", "")
                 if not text:
                     continue
@@ -330,6 +420,8 @@ async def main() -> None:
                 })
                 print(f"[telegram-bridge] registered as '{BRIDGE_SID}', polling...")
                 state: dict = {}
+                # Show session picker immediately on startup
+                await show_home(cs, state)
                 await asyncio.gather(
                     telegram_loop(cs, state),
                     broker_loop(cs),
