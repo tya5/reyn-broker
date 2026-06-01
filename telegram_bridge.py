@@ -140,27 +140,28 @@ def _session_keyboard(sessions: list[dict]) -> dict:
     return {"inline_keyboard": buttons}
 
 
-def _reply_keyboard(sessions: list[dict]) -> dict:
-    """Build a persistent ReplyKeyboardMarkup with session names + utility buttons."""
-    # Session buttons (up to 2 per row)
-    sids = [s["session_id"] for s in sessions if s["session_id"] != BRIDGE_SID]
-    rows = [[{"text": sids[i]}, {"text": sids[i + 1]}] if i + 1 < len(sids)
-            else [{"text": sids[i]}]
-            for i in range(0, len(sids), 2)]
-    # Utility row at bottom
-    rows.append([{"text": "📋 一覧更新"}, {"text": "📊 Stats"}, {"text": "📡 Broadcast"}])
-    return {"keyboard": rows, "resize_keyboard": True, "persistent": True}
+_NAV_KEYBOARD = {
+    "keyboard": [[
+        {"text": "📋 Sessions"},
+        {"text": "📊 Stats"},
+        {"text": "📡 Broadcast"},
+    ]],
+    "resize_keyboard": True,
+    "persistent": True,
+}
 
 
 async def show_home(cs: ClientSession, state: dict) -> None:
-    """Show the persistent session-picker keyboard."""
+    """Show the InlineKeyboard session picker (+ persistent nav keyboard)."""
     sessions = _parse_result(await cs.call_tool("list_sessions", {"compact": True}))
     if not sessions:
-        await send("セッションが登録されていません。")
+        await send("セッションが登録されていません。", keyboard=_NAV_KEYBOARD)
         return
     current = state.get("last_session")
-    label = f"現在の送信先: `{current}`" if current else "送信先を選んでください："
-    await send(label, keyboard=_reply_keyboard(sessions))
+    label = "送信先を選んでください："
+    if current:
+        label += f"\n現在: `{current}`"
+    await send(label, keyboard=_session_keyboard(sessions))
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +201,8 @@ async def handle_command(text: str, cs: ClientSession, state: dict) -> None:
     """Parse a Telegram message and call the appropriate broker tool."""
     text = text.strip()
 
-    # --- Utility buttons from ReplyKeyboard ---
-    if text == "📋 一覧更新":
+    # --- Utility buttons from persistent nav keyboard ---
+    if text in ("📋 Sessions", "📋 一覧更新"):
         await show_home(cs, state)
         return
 
@@ -280,26 +281,14 @@ async def handle_command(text: str, cs: ClientSession, state: dict) -> None:
         await send(f"📡 {result}")
         return
 
-    # セッションIDと一致するボタンタップ → 送信先選択
-    sessions = _parse_result(await cs.call_tool("list_sessions", {"compact": True}))
-    session_ids = {s["session_id"] for s in (sessions or [])}
-    if text in session_ids:
-        state["last_session"] = text
-        # 保留メッセージがあれば送信
-        pending_text = state.pop("_pending_text", None)
-        if pending_text:
-            await _send_to_session(text, pending_text, cs)
-        else:
-            await send(f"✅ 送信先: `{text}`\nメッセージを入力してください。")
-        return
-
     # 送信先が設定済みならそのまま転送
     last = state.get("last_session")
     if last:
         await _send_to_session(last, text, cs)
         return
 
-    # 送信先未設定 → ピッカー表示してテキストを保留
+    # 送信先未設定 → InlineKeyboard ピッカーを出してテキストを保留
+    sessions = _parse_result(await cs.call_tool("list_sessions", {"compact": True}))
     state["_pending_text"] = text
     await send("送信先を選んでください：", keyboard=_session_keyboard(sessions or []))
 
@@ -402,8 +391,8 @@ async def main() -> None:
 
     print(f"[telegram-bridge] starting (session={BRIDGE_SID}, chat_id={CHAT_ID})")
     await send(
-        f"🟢 *broker Telegram bridge started*\n"
-        f"Session: `{BRIDGE_SID}`\nType /help for commands\\."
+        f"🟢 *broker Telegram bridge started*\nSession: `{BRIDGE_SID}`",
+        keyboard=_NAV_KEYBOARD,
     )
 
     while True:
