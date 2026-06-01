@@ -145,6 +145,7 @@ _NAV_KEYBOARD = {
         {"text": "📋 Sessions"},
         {"text": "📊 Stats"},
         {"text": "📡 Broadcast"},
+        {"text": "👁 Monitor"},
     ]],
     "resize_keyboard": True,
     "persistent": True,
@@ -229,6 +230,25 @@ async def handle_command(text: str, cs: ClientSession, state: dict) -> None:
     if text == "📡 Broadcast":
         state["_mode"] = "broadcast"
         await send("broadcast するメッセージを入力してください：")
+        return
+
+    if text == "👁 Monitor":
+        health = _parse_result(await cs.call_tool("health_check", {}))
+        current = health.get("monitor_session")
+        if current:
+            await send(
+                f"👁 Monitor: *ON* (`{current}`)\n監視中のメッセージがこのチャットに転送されます。",
+                keyboard={"inline_keyboard": [[
+                    {"text": "🔴 Monitor OFF", "callback_data": "monitor:off"},
+                ]]},
+            )
+        else:
+            await send(
+                "👁 Monitor: *OFF*\nON にするとすべての broker メッセージがここに転送されます。",
+                keyboard={"inline_keyboard": [[
+                    {"text": "🟢 Monitor ON", "callback_data": "monitor:on"},
+                ]]},
+            )
         return
 
     # --- Slash commands ---
@@ -328,6 +348,14 @@ async def telegram_loop(cs: ClientSession, state: dict) -> None:
                             await _send_to_session(sid, pending_text, cs)
                         else:
                             await send(f"✅ 送信先: `{sid}`\nメッセージを入力してください。")
+                    elif data_str == "monitor:on":
+                        result = _parse_result(await cs.call_tool(
+                            "set_monitor_session", {"session_id": BRIDGE_SID}
+                        ))
+                        await send(f"🟢 {result}")
+                    elif data_str == "monitor:off":
+                        result = _parse_result(await cs.call_tool("set_monitor_session", {}))
+                        await send(f"🔴 {result}")
                     continue
 
                 # Regular text message

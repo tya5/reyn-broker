@@ -591,6 +591,7 @@ async def health_check() -> dict[str, Any]:
         "uptime_seconds": int(time.time() - _STARTED_AT_TS),
         "session_count": sc,
         "total_pending": tp,
+        "monitor_session": _MONITOR_SID,
     }
 
 
@@ -613,6 +614,30 @@ async def tool_stats() -> dict[str, Any]:
         "total_calls": sum(counts.values()),
         "uptime_seconds": int(time.time() - _STARTED_AT_TS),
     }
+
+
+@mcp.tool()
+async def set_monitor_session(session_id: str | None = None) -> str:
+    """Enable or disable the monitor session at runtime.
+
+    When enabled, every ``post_message`` and ``broadcast_message`` queues a
+    stripped copy to ``session_id`` (with an added ``monitor_to`` field
+    showing the original target). This lets a dedicated session (e.g. the
+    Telegram bridge) observe all inter-session traffic without being the
+    intended recipient.
+
+    Pass ``session_id`` to enable monitoring (replaces any current setting).
+    Omit or pass ``None`` to disable monitoring.
+
+    Note: this change is in-memory only and resets on broker restart.
+    To persist, set ``BROKER_MONITOR_SESSION`` in the broker's environment.
+    """
+    global _MONITOR_SID
+    _tool_call_counts["set_monitor_session"] += 1
+    _MONITOR_SID = session_id if session_id else None
+    if _MONITOR_SID:
+        return f"monitor enabled: all messages copied to '{_MONITOR_SID}'"
+    return "monitor disabled"
 
 
 def main() -> None:
