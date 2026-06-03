@@ -80,8 +80,9 @@ _COMMAND_ATTR = "_broker_command"
 class CommandSpec:
     name: str
     description: str
-    args: list[str]          # ordered positional arg names (excluding self, broker)
+    args: list[str]          # ordered positional arg names (excluding self, broker, sender)
     method_name: str
+    has_sender: bool = False  # True when method declares a ``sender: str`` parameter
 
 
 def command(description: str = "", name: str = "") -> Callable:
@@ -89,11 +90,20 @@ def command(description: str = "", name: str = "") -> Callable:
 
     The decorated method must have the signature::
 
-        async def my_command(self, arg1: str, arg2: str, ..., broker: BrokerClient) -> str:
+        async def my_command(self, arg1: str, ..., broker: BrokerClient) -> str:
             ...
 
-    All positional parameters (except ``self`` and the final ``broker``
-    parameter) are extracted from the incoming message text.
+    To receive the caller's session id, add an optional ``sender`` parameter::
+
+        async def my_command(self, arg1: str, broker: BrokerClient, sender: str = "") -> str:
+            ...
+
+    ``sender`` is injected by the framework and is NOT treated as a
+    user-supplied argument (it does not appear in ``args`` or the command
+    schema seen by callers).
+
+    All other positional parameters (except ``self``, ``broker``, ``sender``)
+    are extracted from the incoming message text.
 
     Message format expected by callers::
 
@@ -112,14 +122,16 @@ def command(description: str = "", name: str = "") -> Callable:
     def decorator(fn: Callable) -> Callable:
         sig = inspect.signature(fn)
         params = list(sig.parameters.keys())
-        # strip 'self' and trailing 'broker' parameter
-        arg_names = [p for p in params if p not in ("self", "broker")]
+        has_sender = "sender" in params
+        # positional args = everything except self, broker, sender
+        arg_names = [p for p in params if p not in ("self", "broker", "sender")]
         cmd_name = name or fn.__name__
         setattr(fn, _COMMAND_ATTR, CommandSpec(
             name=cmd_name,
             description=description,
             args=arg_names,
             method_name=fn.__name__,
+            has_sender=has_sender,
         ))
         return fn
     return decorator
@@ -149,6 +161,35 @@ class BrokerClient:
     # ------------------------------------------------------------------
     # Messaging
     # ------------------------------------------------------------------
+
+    async def subscribe_events(
+        self,
+        event_types: list[str],
+        session_filter: list[str] | None = None,
+    ) -> str:
+        """Subscribe this plugin to session lifecycle events via its inbox.
+
+        Events are delivered as broker messages with an ``event`` field::
+
+            {"from": "broker", "event": "posted", "session_id": "...", "at": "..."}
+
+        Handle them in :meth:`on_broker_message` by checking ``msg.get("event")``.
+
+        Parameters
+        ----------
+        event_types : list[str]
+            Any subset of ``["registered", "unregistered", "posted"]``.
+        session_filter : list[str] | None
+            Limit events to these session ids.  ``None`` = all sessions.
+        """
+        args: dict[str, Any] = {
+            "subscriber_id": self._session_id,
+            "event_types": event_types,
+        }
+        if session_filter is not None:
+            args["session_filter"] = session_filter
+        result = await self._cs.call_tool("subscribe_session_events", args)
+        return str(_parse_result(result))
 
     async def post(self, to: str, message: str, **kwargs: Any) -> str:
         """Send a message to one session. ``from_session`` is set automatically."""
@@ -409,7 +450,10 @@ class BrokerPlugin:
             raw_args += [""] * (len(spec.args) - len(raw_args))
             call_args = raw_args[:len(spec.args)]
             try:
-                reply = await method(*call_args, broker=broker)
+                kwargs: dict[str, Any] = {"broker": broker}
+                if spec.has_sender:
+                    kwargs["sender"] = sender
+                reply = await method(*call_args, **kwargs)
                 if reply and sender:
                     await broker.post(to=sender, message=str(reply))
             except Exception as exc:

@@ -124,7 +124,7 @@ get_plugin_commands("echo")
 
 ### `broker` 引数の規約
 
-`@command` で宣言するメソッドは必ず最後の引数として `broker: BrokerClient` を受け取ってください。これはフレームワークが自動的に注入します。省略すると `TypeError` が発生し、呼び出し元にエラー返信が届きます。
+`@command` で宣言するメソッドは必ず `broker: BrokerClient` を受け取ってください。これはフレームワークが自動的に注入します。省略すると `TypeError` が発生し、呼び出し元にエラー返信が届きます。
 
 ```python
 # ✅ 正しい
@@ -132,6 +132,17 @@ async def watch(self, pr_number: str, broker: BrokerClient) -> str: ...
 
 # ❌ broker 引数が無い
 async def watch(self, pr_number: str) -> str: ...
+```
+
+### 呼び出し元 session id を受け取る（`sender`）
+
+コマンドの中で「誰が呼んだか」を知る必要がある場合（サブスクリプション管理など）は、`sender: str = ""` を追加してください。フレームワークが呼び出し元の session id を自動で注入します。`sender` はユーザー供給の引数ではないためコマンドスキーマには現れません。
+
+```python
+@command(description="Subscribe to events for a repo")
+async def watch(self, repo: str, broker: BrokerClient, sender: str = "") -> str:
+    self._subscribers[repo].add(sender)
+    return f"subscribed {sender} to {repo}"
 ```
 
 ### on_broker_message へのフォールバック
@@ -152,6 +163,17 @@ await broker.broadcast(message="all hands")
 sessions = await broker.list_sessions(compact=True)
 msgs = await broker.peek(limit=5)
 ```
+
+### セッションイベント購読
+
+```python
+await broker.subscribe_events(
+    event_types=["posted", "registered", "unregistered"],
+    session_filter=None,  # None = 全セッション
+)
+```
+
+`list_sessions` ポーリングの代わりにイベント購読を使うことでブローカー負荷を下げられます。イベントは `on_broker_message` に届きます（`msg.get("event")` でイベント種別を確認）。
 
 ### ポーリング制御
 
@@ -392,6 +414,44 @@ post_message(to="github-ci", from_session="me", message="list")
 ```
 
 複数セッションが同じ PR を watch した場合、全員に通知が届きます。
+
+### `peer_stall_watcher.py` — Peer Stall 検出
+
+セッションの活動を `subscribe_session_events` でリアルタイム追跡し、一定時間沈黙しているセッションを検出して通知します。`list_sessions` ポーリング不要。
+
+環境変数: `PEER_STALL_THRESHOLD_S`（デフォルト 900s）、`PEER_STALL_NOTIFY`（デフォルト `backlog-watcher`）、`PEER_STALL_EXCLUDE`（除外セッション、カンマ区切り）
+
+```python
+plugin_add(
+    name="peer-stall-watcher",
+    command="/path/to/.venv/bin/reyn-broker-peer-stall",
+    session_id="peer-stall-watcher",
+    auto_start=True,
+)
+```
+
+### `plugins/github_pr_watcher.py` — GitHub PR 状態監視
+
+GitHub PR の open/merged/closed と mergeStateStatus (CLEAN/DIRTY) の変化を監視し、サブスクライバーに通知します。
+
+必要条件: `gh` CLI がインストールされ認証済み
+
+```python
+plugin_add(
+    name="github-pr-watcher",
+    command="/path/to/.venv/bin/reyn-broker-github-pr",
+    session_id="github-pr-watcher",
+    auto_start=True,
+)
+```
+
+コマンド:
+```python
+post_message(to="github-pr-watcher", from_session="me", message="watch:tya5/reyn")
+# → pr_opened / pr_merged / pr_clean 等のイベントが届く
+post_message(to="github-pr-watcher", from_session="me", message="unwatch:tya5/reyn")
+post_message(to="github-pr-watcher", from_session="me", message="list")
+```
 
 ---
 
