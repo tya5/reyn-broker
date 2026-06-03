@@ -27,7 +27,7 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.14.0"
+_VERSION = "0.15.0"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.
@@ -48,7 +48,9 @@ class SessionEntry:
     last_post_at: str | None = None
     last_receive_at: str | None = None
     session_expires_at: float | None = None  # epoch timestamp; None = no TTL
-    status: str | None = None               # last reported status (e.g. "active", "idle")
+    # Two orthogonal axes (see set_active / update_session_status):
+    active: bool = True                     # mechanical liveness (hook-driven); True = working
+    status: str | None = None               # semantic status (LLM-driven), e.g. "waiting"
     status_detail: str | None = None        # optional free-form status detail
 
 
@@ -224,6 +226,7 @@ def _save_state() -> None:
                     "last_post_at": e.last_post_at,
                     "last_receive_at": e.last_receive_at,
                     "session_expires_at": e.session_expires_at,
+                    "active": e.active,
                     "status": e.status,
                     "status_detail": e.status_detail,
                 }
@@ -277,6 +280,7 @@ def _load_state() -> None:
             last_post_at=entry.get("last_post_at"),
             last_receive_at=entry.get("last_receive_at"),
             session_expires_at=entry.get("session_expires_at"),
+            active=entry.get("active", True),
             status=entry.get("status"),
             status_detail=entry.get("status_detail"),
         )
@@ -425,7 +429,8 @@ def _session_list_locked(compact: bool) -> list[dict[str, Any]]:
     """Serialise the session registry.  Caller MUST hold ``registry_lock``."""
     if compact:
         return [
-            {"session_id": e.session_id, "role": e.role, "status": e.status}
+            {"session_id": e.session_id, "role": e.role,
+             "active": e.active, "status": e.status}
             for e in sessions.values()
         ]
     return [
@@ -436,6 +441,7 @@ def _session_list_locked(compact: bool) -> list[dict[str, Any]]:
             "last_post_at": e.last_post_at,
             "last_receive_at": e.last_receive_at,
             "inbox_unread_count": len(_purge_expired(pending.get(e.session_id, []))),
+            "active": e.active,
             "status": e.status,
             "status_detail": e.status_detail,
         }
@@ -538,21 +544,65 @@ async def unregister_session(session_id: str) -> str:
 
 
 @mcp.tool()
+async def set_active(session_id: str, active: bool) -> str:
+    """Set a session's mechanical liveness flag (the DETERMINISTIC axis).
+
+    This axis is meant to be driven by Claude Code hooks at zero LLM cost:
+    - work-start hook (UserPromptSubmit / PreToolUse) → ``set_active(id, True)``
+    - Stop hook                                       → ``set_active(id, False)``
+
+    It is orthogonal to ``update_session_status`` (the semantic axis: *what*
+    the session is waiting for). ``set_active`` never touches ``status`` /
+    ``detail``, so a mechanical idle from a Stop hook cannot clobber an
+    LLM-declared waiting reason — and vice versa. This is the authoritative
+    signal monitors should use for stall/idle detection; ``status`` is
+    best-effort enrichment.
+
+    Fires an ``active_changed`` event (carrying ``active``, ``prev_active``,
+    and the current ``status`` / ``detail`` for enrichment) only when the
+    value actually changes — so a PreToolUse hook firing ``True`` repeatedly
+    is a no-op and never spams subscribers.
+
+    Hooks should use the ``reyn-broker-active`` CLI (no MCP round-trip needed).
+    """
+    _tool_call_counts["set_active"] += 1
+    async with registry_lock:
+        entry = sessions.get(session_id)
+        if entry is None:
+            return f"'{session_id}' is not registered"
+        if entry.active == active:
+            return f"active unchanged: '{session_id}' already active={active}"
+        prev_active = entry.active
+        entry.active = active
+        _push_session_event_locked(
+            "active_changed", session_id,
+            extra={"active": active, "prev_active": prev_active,
+                   "status": entry.status, "detail": entry.status_detail},
+        )
+        _save_state()
+    return f"active updated: '{session_id}' → {active}"
+
+
+@mcp.tool()
 async def update_session_status(
     session_id: str,
     status: str,
     detail: str | None = None,
 ) -> str:
-    """Report this session's current activity status.
+    """Report this session's SEMANTIC status (the best-effort axis).
 
-    Call this whenever your state changes so that monitoring plugins
-    (e.g. stall watchers) can track you accurately without inferring
-    state from message timestamps.
+    This is the LLM-driven axis describing *what* the session is doing or
+    waiting for (e.g. ``"waiting"`` + ``detail="ci:#1268"``). It is orthogonal
+    to ``set_active`` (the mechanical liveness bool): this call never touches
+    ``active``, so it cannot be clobbered by a Stop hook's ``set_active(False)``.
+
+    Monitors treat ``status`` as enrichment, not authority — stall/idle
+    detection keys off the ``active`` bool. Setting ``status`` lets monitors
+    show *why* a session is idle/blocked, but is never required.
 
     Recommended status values (any string is accepted):
-    - ``"active"``  — working on a task.
-    - ``"idle"``    — waiting for user input or nothing to do.
     - ``"waiting"`` — blocked on an external event (describe in ``detail``).
+    - ``"idle"``    — nothing to do (usually the active bool already conveys this).
 
     The broker fires a ``status_changed`` event to any session subscribed
     via ``subscribe_session_events``.  The event carries the new ``status``,
@@ -592,19 +642,21 @@ async def get_session_status(session_id: str) -> dict[str, Any]:
     to confirm a session's status before acting on it — particularly useful
     in delayed checks where in-memory state may be stale due to missed events.
 
-    Returns a dict with ``session_id``, ``status``, ``status_detail``, and
-    ``registered`` (bool).  If the session is not registered, ``registered``
-    is ``False`` and ``status`` / ``status_detail`` are ``None``.
+    Returns a dict with ``session_id``, ``registered`` (bool), ``active``
+    (bool — the mechanical liveness axis), ``status`` and ``status_detail``
+    (the semantic axis). If the session is not registered, ``registered`` is
+    ``False`` and the other fields are ``None``.
     """
     _tool_call_counts["get_session_status"] += 1
     async with registry_lock:
         entry = sessions.get(session_id)
     if entry is None:
         return {"session_id": session_id, "registered": False,
-                "status": None, "status_detail": None}
+                "active": None, "status": None, "status_detail": None}
     return {
         "session_id": session_id,
         "registered": True,
+        "active": entry.active,
         "status": entry.status,
         "status_detail": entry.status_detail,
     }
@@ -959,7 +1011,9 @@ async def list_plugin_commands(session_id: str) -> list[dict[str, Any]]:
 # Session event subscription tools
 # ---------------------------------------------------------------------------
 
-_VALID_EVENT_TYPES = frozenset({"registered", "unregistered", "posted", "status_changed"})
+_VALID_EVENT_TYPES = frozenset(
+    {"registered", "unregistered", "posted", "status_changed", "active_changed"}
+)
 
 
 @mcp.tool()
@@ -987,8 +1041,12 @@ async def subscribe_session_events(
     - ``"posted"`` — a session called ``post_message`` or
       ``broadcast_message``.
     - ``"status_changed"`` — a session called ``update_session_status``
-      with a new value. The event payload carries extra ``status`` and
-      ``detail`` fields.
+      with a new value (semantic axis). Payload carries ``status``,
+      ``detail``, and ``prev_status``.
+    - ``"active_changed"`` — a session's mechanical liveness bool flipped
+      via ``set_active``. Payload carries ``active``, ``prev_active``, and
+      the current ``status`` / ``detail`` for enrichment. This is the
+      authoritative edge for stall/idle detection (active False = idle).
 
     ``session_filter`` — optional list of session ids to watch. ``None``
     (default) means watch all sessions.

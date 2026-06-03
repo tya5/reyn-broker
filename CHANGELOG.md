@@ -2,6 +2,44 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.15.0] - 2026-06-03
+
+### Added
+- **`set_active(session_id, active: bool)` tool** — a mechanical liveness axis
+  separate from `update_session_status`. Hook-driven (work-start → `True`,
+  Stop → `False`) and deterministic; this is the authoritative signal monitors
+  use for stall/idle detection. Fires an `active_changed` event only on an
+  actual flip (repeated same-value calls are no-ops, so a PreToolUse hook
+  firing `True` every tool call does not spam subscribers).
+- **`active_changed` event type** — payload carries `active`, `prev_active`,
+  and the current `status` / `detail` for enrichment.
+- **`reyn-broker-active SESSION_ID true|false` CLI** — zero-LLM-cost hook entry
+  point for the active axis (mirrors `reyn-broker-status` for the semantic axis).
+- **Multiple independent event subscriptions** — `subscribe_session_events` no
+  longer merges; a subscriber may hold several `(event_types, session_filter)`
+  pairs that are evaluated independently. An event is delivered at most once
+  per subscriber. Identical pairs are idempotent.
+- **`status_changed` carries `prev_status`** — lets consumers edge-detect
+  rather than re-fire on detail-only updates.
+
+### Changed
+- **Two orthogonal status axes (fixes a clobber bug).** Previously the single
+  `status` + `detail` field carried both the mechanical (hook) and semantic
+  (LLM) meaning. A Stop hook's `update_session_status(id, "idle")` would wipe
+  an LLM-declared `update_session_status(id, "waiting", "ci:#1268")` because
+  `detail` was overwritten unconditionally and the Stop hook always runs last.
+  Now `set_active` (mechanical bool) and `update_session_status` (semantic
+  string) are independent fields with independent setters — neither clobbers
+  the other.
+- `list_sessions` (compact + full) and `get_session_status` now include
+  `active`.
+- `peer_idle_notifier` subscribes to `active_changed` (False edge) instead of
+  `status_changed`; semantic `status`/`detail` ride along as enrichment.
+
+### ⚠️ Schema change notice
+New tool `set_active`; new event `active_changed`; `list_sessions` /
+`get_session_status` gained `active`. Run `ToolSearch` to refresh schemas.
+
 ## [0.14.0] - 2026-06-03
 
 ### Added

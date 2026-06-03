@@ -98,8 +98,9 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `receive_messages`  | `session_id`, `fields?`                         | Drain and return the caller's inbox. `fields=["from","message"]` strips metadata to reduce token overhead. |
 | `peek_messages`     | `session_id`, `limit?`, `fields?`              | Non-destructive content preview: returns up to `limit` (default 10) messages without draining. Supports `fields` selector. |
 | `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
-| `update_session_status` | `session_id`, `status`, `detail?`           | Report current activity state (`"active"`, `"idle"`, `"waiting"`, …). Fires a `status_changed` event to subscribers. No-op when value is unchanged. |
-| `get_session_status` | `session_id`                                   | Return authoritative `{registered, status, status_detail}` for one session. |
+| `set_active`        | `session_id`, `active`                          | Set the mechanical liveness bool (hook-driven, deterministic). Fires `active_changed` only on a real flip. The authoritative signal for stall/idle detection. Orthogonal to `update_session_status` — never clobbers `status`. |
+| `update_session_status` | `session_id`, `status`, `detail?`           | Report the semantic status (LLM-driven, e.g. `"waiting"` + reason). Fires `status_changed`. Enrichment only; never touches `active`. |
+| `get_session_status` | `session_id`                                   | Return `{registered, active, status, status_detail}` for one session. |
 | `subscribe_session_events` | `subscriber_id`, `event_types`, `session_filter?` | Push session lifecycle events (`registered`, `unregistered`, `posted`, `status_changed`) into the subscriber's inbox. |
 | `unsubscribe_session_events` | `subscriber_id`                          | Cancel an event subscription.                                                   |
 | `tool_stats`        | *(none)*                                        | Return per-tool call counts since broker start. Useful for token-cost analysis. |

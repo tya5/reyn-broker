@@ -46,29 +46,50 @@ from mcp.client.streamable_http import streamable_http_client
 _BROKER_URL = os.environ.get("BROKER_URL", "http://127.0.0.1:8765/mcp")
 
 
-async def _update(session_id: str, status: str, detail: str | None) -> None:
+async def _call(tool: str, args: dict) -> None:
     async with (
         streamable_http_client(_BROKER_URL) as (read, write, _close),
         ClientSession(read, write) as cs,
     ):
         await cs.initialize()
-        args: dict = {"session_id": session_id, "status": status}
-        if detail:
-            args["detail"] = detail
-        await cs.call_tool("update_session_status", args)
+        await cs.call_tool(tool, args)
 
 
 def main() -> None:
+    """reyn-broker-status SESSION_ID STATUS [DETAIL] — set the semantic axis."""
     if len(sys.argv) < 3:
         print(f"usage: {sys.argv[0]} SESSION_ID STATUS [DETAIL]", file=sys.stderr)
         sys.exit(1)
-    session_id = sys.argv[1]
-    status = sys.argv[2]
-    detail = sys.argv[3] if len(sys.argv) > 3 else None
+    session_id, status = sys.argv[1], sys.argv[2]
+    args: dict = {"session_id": session_id, "status": status}
+    if len(sys.argv) > 3:
+        args["detail"] = sys.argv[3]
     try:
-        asyncio.run(_update(session_id, status, detail))
+        asyncio.run(_call("update_session_status", args))
     except Exception as exc:
         print(f"[session_status] error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main_active() -> None:
+    """reyn-broker-active SESSION_ID true|false — set the mechanical liveness axis.
+
+    Intended for Claude Code hooks (zero LLM cost):
+      work-start hook → reyn-broker-active <id> true
+      Stop hook       → reyn-broker-active <id> false
+    """
+    if len(sys.argv) < 3:
+        print(f"usage: {sys.argv[0]} SESSION_ID true|false", file=sys.stderr)
+        sys.exit(1)
+    session_id, raw = sys.argv[1], sys.argv[2].strip().lower()
+    if raw not in ("true", "false"):
+        print(f"[session_active] active must be 'true' or 'false', got {raw!r}", file=sys.stderr)
+        sys.exit(1)
+    args = {"session_id": session_id, "active": raw == "true"}
+    try:
+        asyncio.run(_call("set_active", args))
+    except Exception as exc:
+        print(f"[session_active] error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 

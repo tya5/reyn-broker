@@ -1,6 +1,6 @@
 [project]
 name = "reyn-broker"
-version = "0.14.0"
+version = "0.15.0"
 description = "A small MCP broker that lets multiple Claude Code sessions exchange messages by session id."
 readme = "README.md"
 license = "MIT"
@@ -38,6 +38,7 @@ reyn-broker-github-ci = "plugins.github_ci_watcher:main"
 reyn-broker-github-pr = "plugins.github_pr_watcher:main"
 reyn-broker-peer-idle = "peer_idle_notifier:main"
 reyn-broker-status = "session_status:main"
+reyn-broker-active = "session_status:main_active"
 
 [project.urls]
 Homepage = "https://github.com/tya5/reyn-broker"

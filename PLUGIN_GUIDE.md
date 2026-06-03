@@ -266,43 +266,51 @@ await broker.subscribe_events(
 > 非決定論的な当て推量（長い正計算で静かなだけ / 真に stuck / 人間待ち を区別
 > 不能）。**自分の状態を決定論的に知るのは session 自身だけ。**
 
-したがって監視プラグインの正しい形は「**session の自己申告（`status_changed`）に
-反応するだけ。watcher 側で推論しない**」。これは broker の "broker=hint,
-contract=決定論" 哲学と同型。
+したがって監視プラグインの正しい形は「**session の自己申告に反応するだけ。watcher
+側で推論しない**」。これは broker の "broker=hint, contract=決定論" 哲学と同型。
+
+状態は**2軸**に分かれる（混同しないこと）:
+
+| 軸 | イベント | 設定者 | 役割 |
+|---|---|---|---|
+| **active**（機械的 bool） | `active_changed` | hook | **stall 判定の authority**。これを購読する |
+| **status**（意味的 str） | `status_changed` | LLM | enrichment（「なぜ idle か」）。authority ではない |
 
 **前提となる session 側の責務**（SESSION_GUIDE §4.5）:
-- 各 session は **両エッジ**を申告する義務を負う —
-  作業開始 → `active`、作業終了/停止 → `idle`。
-- Stop hook から `reyn-broker-status <id> idle` を撃つ（LLM turn 不要の one-shot CLI）。
+- 各 session は **active の両エッジ**を hook で撃つ — 作業開始 → `reyn-broker-active <id> true`、
+  停止 → `reyn-broker-active <id> false`（いずれも LLM turn 不要の one-shot CLI）。
 - active-edge は user-prompt 起点と **wakeup 起点の両方**でカバーする
-  （さもないと dormancy 体質の session が再開時に idle 解除し損ねる）。
+  （さもないと dormancy 体質の session が再開時に解除し損ねる）。
 
-この責務が満たされて初めて、下記の idle notifier が「なぜ `status_changed`
-購読だけで閉じるか」が成立する。`waiting_for` のような「何で待っているか」は
-session が申告に添える **任意の hint** に留め、watcher 側で stall 判定に使わない。
+この責務が満たされて初めて、下記の idle notifier が「なぜ `active_changed` 購読
+だけで閉じるか」が成立する。`active_changed` はフリップ時のみ発火するので、watcher
+側にエッジ判定の状態を持つ必要すらない。
 
 ### peer idle notifier での活用例
 
-セッションが `update_session_status(..., status="idle")` を呼んだ瞬間に検知して通知します。ポーリング不要・タイマー不要。
+セッションの `active` が False にフリップした瞬間（典型的には Stop hook の
+`reyn-broker-active <id> false`）に検知して通知します。ポーリング不要・タイマー不要・
+状態保持不要。意味的 `status`/`detail` はイベントに enrichment として同梱されます。
 
 ```python
 class PeerIdleNotifier(BrokerPlugin):
     session_id = "peer-idle-notifier"
-    role = "peer idle detection — fires immediately on status → idle"
+    role = "peer idle detection — fires immediately on active → False"
 
     async def on_start(self, broker: BrokerClient) -> None:
-        await broker.subscribe_events(["status_changed"])
+        await broker.subscribe_events(["active_changed"])
 
     async def on_broker_message(self, msg, broker: BrokerClient) -> None:
-        if msg.get("event") != "status_changed":
+        if msg.get("event") != "active_changed":
             return
         sid = msg.get("session_id", "")
-        # Notify only on the transition INTO idle (active→idle), not on an
-        # idle→idle detail edit. Use prev_status to detect the edge.
-        if msg.get("status") == "idle" and msg.get("prev_status") != "idle":
+        # active_changed only fires on a real flip → active=False is the
+        # genuine work→idle edge. No edge-detection bookkeeping needed.
+        if msg.get("active") is False:
+            why = msg.get("status") or "?"   # best-effort enrichment
             await broker.post(
                 to="backlog-watcher",
-                message=f"PEER_IDLE: {sid} is ready for new work",
+                message=f"PEER_IDLE: {sid} ready (status={why})",
             )
 ```
 
@@ -348,23 +356,38 @@ class PeerIdleNotifier(BrokerPlugin):
 
 ---
 
-### `status_changed`
+### `active_changed`（stall/idle 検出の authority）
+
+| フィールド | 値 |
+|---|---|
+| `event` | `"active_changed"` |
+| `session_id` | 対象セッション ID |
+| `active` | 新しい機械的 liveness（`True` = 作業中 / `False` = idle）|
+| `prev_active` | 直前の値 |
+| `status` | その時点の意味的ステータス（enrichment、`None` あり）|
+| `detail` | 意味的 detail（enrichment、`None` あり）|
+| `at` | 更新時刻 |
+
+**トリガー**: `set_active` が呼ばれ、かつ値が実際にフリップしたとき（同値は no-op で発火なし）。
+hook 由来・決定論。**stall/idle 検出はこのイベントの `active == False` エッジを使う**。
+フリップ時のみ発火するので、購読側はエッジ判定の状態を持つ必要がない。
+
+### `status_changed`（意味的・enrichment）
 
 | フィールド | 値 |
 |---|---|
 | `event` | `"status_changed"` |
 | `session_id` | 状態を更新したセッション ID |
-| `status` | 新しいステータス文字列（`"active"` / `"idle"` / `"waiting"` など）|
-| `prev_status` | 直前のステータス（`None` の場合あり）。エッジ判定に使う |
-| `detail` | 任意の補足説明（`None` の場合あり）|
+| `status` | 新しい意味的ステータス（`"waiting"` など）|
+| `prev_status` | 直前のステータス（`None` あり）。エッジ判定に使う |
+| `detail` | 任意の補足説明（`None` あり）|
 | `at` | 更新時刻 |
 
-**トリガー**: `update_session_status` が呼ばれ、かつ status **または** detail が変化したとき（両方同一なら発火なし）。
+**トリガー**: `update_session_status` が呼ばれ、かつ status **または** detail が変化したとき（両方同一なら発火なし）。LLM 由来・best-effort。stall 判定の authority ではない（それは `active_changed`）。
 
-> **⚠️ detail だけの変化でも発火する**: `(idle, A) → (idle, B)` のように status が
-> idle のままでも detail が変われば `status_changed` が発火する。「idle への遷移」だけに
-> 反応したい監視プラグインは `status == "idle" and prev_status != "idle"` のように
-> **`prev_status` でエッジ判定**すること（さもないと detail 編集を新規 idle と誤認する）。
+> **⚠️ detail だけの変化でも発火する**: `(waiting, A) → (waiting, B)` のように status が
+> 同じでも detail が変われば発火する。特定 status への遷移だけに反応したい場合は
+> `prev_status` でエッジ判定すること。
 
 ---
 

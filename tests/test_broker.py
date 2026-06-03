@@ -704,7 +704,7 @@ async def test_list_sessions_compact_returns_only_id_and_role(broker_url: str) -
             {"session_id": "alice", "working_dir": "/tmp/a", "role": "tester"},
         )
         result = _payload(await a.call_tool("list_sessions", {"compact": True}))
-    assert result == [{"session_id": "alice", "role": "tester", "status": None}]
+    assert result == [{"session_id": "alice", "role": "tester", "active": True, "status": None}]
 
 
 @pytest.mark.asyncio
@@ -979,7 +979,7 @@ async def test_session_ttl_expires_and_removed(broker_url: str) -> None:
 async def test_health_check_returns_expected_fields(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.14.0"
+    assert result["version"] == "0.15.0"
     assert isinstance(result["uptime_seconds"], int)
     assert result["uptime_seconds"] >= 0
     assert result["started_at_iso"].startswith("20")
@@ -1295,7 +1295,7 @@ async def test_restart_plugin(broker_url: str) -> None:
 async def test_health_check_version_updated(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.14.0"
+    assert result["version"] == "0.15.0"
 
 
 # ---------------------------------------------------------------------------
@@ -1378,3 +1378,75 @@ async def test_status_changed_carries_prev_status(broker_url: str) -> None:
     # An edge-detecting consumer (prev != idle, status == idle) sees one idle edge.
     idle_edges = [t for t in transitions if t[1] == "idle" and t[0] != "idle"]
     assert len(idle_edges) == 1
+
+
+# ---------------------------------------------------------------------------
+# set_active — mechanical liveness axis, orthogonal to status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_active_does_not_clobber_status(broker_url: str) -> None:
+    """A Stop-hook set_active(False) must not wipe an LLM-declared status."""
+    async with _client(broker_url) as c:
+        await c.call_tool("register_session", {"session_id": "x", "working_dir": "/tmp/x"})
+        # LLM declares semantic status
+        await c.call_tool("update_session_status", {
+            "session_id": "x", "status": "waiting", "detail": "ci:#1268",
+        })
+        # Stop hook flips mechanical liveness
+        await c.call_tool("set_active", {"session_id": "x", "active": False})
+        st = _payload(await c.call_tool("get_session_status", {"session_id": "x"}))
+    assert st["active"] is False
+    assert st["status"] == "waiting"          # not clobbered
+    assert st["status_detail"] == "ci:#1268"  # not clobbered
+
+
+@pytest.mark.asyncio
+async def test_update_status_does_not_touch_active(broker_url: str) -> None:
+    """update_session_status leaves the active bool untouched."""
+    async with _client(broker_url) as c:
+        await c.call_tool("register_session", {"session_id": "x", "working_dir": "/tmp/x"})
+        await c.call_tool("set_active", {"session_id": "x", "active": False})
+        await c.call_tool("update_session_status", {"session_id": "x", "status": "waiting"})
+        st = _payload(await c.call_tool("get_session_status", {"session_id": "x"}))
+    assert st["active"] is False  # status update did not flip it back to active
+
+
+@pytest.mark.asyncio
+async def test_active_changed_event_carries_status_enrichment(broker_url: str) -> None:
+    async with _client(broker_url) as s, _client(broker_url) as a:
+        await s.call_tool("register_session", {"session_id": "sub", "working_dir": "/tmp/s"})
+        await a.call_tool("register_session", {"session_id": "A", "working_dir": "/tmp/a"})
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["active_changed"], "session_filter": ["A"],
+        })
+        await s.call_tool("receive_messages", {"session_id": "sub"})
+        await a.call_tool("update_session_status", {
+            "session_id": "A", "status": "waiting", "detail": "ci:#1",
+        })
+        await a.call_tool("set_active", {"session_id": "A", "active": False})
+        msgs = [m for m in _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
+                if m.get("event") == "active_changed"]
+    assert len(msgs) == 1
+    assert msgs[0]["active"] is False
+    assert msgs[0]["prev_active"] is True
+    assert msgs[0]["status"] == "waiting"   # enrichment carried on the event
+    assert msgs[0]["detail"] == "ci:#1"
+
+
+@pytest.mark.asyncio
+async def test_set_active_noop_when_unchanged(broker_url: str) -> None:
+    """Setting active to its current value fires no event (no spam)."""
+    async with _client(broker_url) as s, _client(broker_url) as a:
+        await s.call_tool("register_session", {"session_id": "sub", "working_dir": "/tmp/s"})
+        await a.call_tool("register_session", {"session_id": "A", "working_dir": "/tmp/a"})
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["active_changed"], "session_filter": ["A"],
+        })
+        await s.call_tool("receive_messages", {"session_id": "sub"})
+        # A registered active=True by default; set_active(True) is a no-op
+        await a.call_tool("set_active", {"session_id": "A", "active": True})
+        msgs = [m for m in _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
+                if m.get("event") == "active_changed"]
+    assert msgs == []

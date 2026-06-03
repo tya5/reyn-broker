@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Peer idle notifier plugin for reyn-broker.
 
-Subscribes to ``status_changed`` events and immediately notifies
-PEER_IDLE_NOTIFY when a monitored session transitions to an idle state.
+Subscribes to ``active_changed`` events and immediately notifies
+PEER_IDLE_NOTIFY when a monitored session goes idle (its mechanical liveness
+bool flips to False — typically driven by the session's Stop hook calling
+``set_active(id, False)``).
 
-Use this to detect when a session finishes its current task and is ready
-for new work — the notification fires the moment the session calls
-``update_session_status(..., status="idle")``.
+The ``active`` bool is the *authoritative* idle signal (deterministic,
+hook-driven). The session's semantic ``status`` / ``detail`` (e.g. "waiting"
++ "ci:#1268") is carried along the event as best-effort enrichment so the
+notification can say *why* the session is idle when that info exists.
 
 Runs as a broker-managed plugin (auto_start=True recommended).
 
@@ -15,8 +18,6 @@ Environment variables
 PEER_IDLE_NOTIFY     Target session for notifications (default: backlog-watcher)
 PEER_IDLE_WATCH      Comma-separated session ids to monitor.
                      If unset, all sessions except broker and self are watched.
-PEER_IDLE_STATES     Comma-separated status values that trigger notification
-                     (default: idle)
 """
 from __future__ import annotations
 
@@ -34,14 +35,11 @@ _NOTIFY_TARGET = os.environ.get("PEER_IDLE_NOTIFY", "backlog-watcher")
 _WATCH_LIST: frozenset[str] | None = (
     frozenset(filter(None, os.environ.get("PEER_IDLE_WATCH", "").split(","))) or None
 )
-_IDLE_STATES: frozenset[str] = frozenset(
-    filter(None, os.environ.get("PEER_IDLE_STATES", "idle").split(","))
-)
 
 
 class PeerIdleNotifier(BrokerPlugin):
     session_id = "peer-idle-notifier"
-    role = "peer idle detection — notifies immediately on status → idle"
+    role = "peer idle detection — notifies immediately on active → False"
 
     def _should_watch(self, sid: str) -> bool:
         if sid in {"broker", self.session_id}:
@@ -49,25 +47,23 @@ class PeerIdleNotifier(BrokerPlugin):
         return sid in _WATCH_LIST if _WATCH_LIST is not None else True
 
     async def on_start(self, broker: BrokerClient) -> None:
-        await broker.subscribe_events(["status_changed"])
-        logger.info("[%s] subscribed to status_changed events", self.session_id)
+        await broker.subscribe_events(["active_changed"])
+        logger.info("[%s] subscribed to active_changed events", self.session_id)
 
     async def on_broker_message(self, msg: dict[str, Any], broker: BrokerClient) -> None:
-        if msg.get("event") != "status_changed":
+        if msg.get("event") != "active_changed":
             return
         sid = msg.get("session_id", "")
         if not sid or not self._should_watch(sid):
             return
-        status = msg.get("status", "")
-        prev = msg.get("prev_status")
-        # Only notify on the *transition* into an idle state. A change that
-        # stays within idle states (e.g. an idle detail edit: idle→idle) must
-        # not re-fire, otherwise a detail update looks like a fresh idle.
-        if status in _IDLE_STATES and prev not in _IDLE_STATES:
+        # active_changed only fires on an actual flip, so active=False here is
+        # always the genuine work→idle edge. No edge-detection bookkeeping needed.
+        if msg.get("active") is False:
+            status = msg.get("status") or ""
             detail = msg.get("detail") or ""
-            text = f"PEER_IDLE: {sid} → {status}"
-            if detail:
-                text += f" ({detail})"
+            text = f"PEER_IDLE: {sid} is ready for new work"
+            if status:
+                text += f" (status={status}" + (f": {detail}" if detail else "") + ")"
             await broker.post(to=_NOTIFY_TARGET, message=text)
             logger.info("%s", text)
 

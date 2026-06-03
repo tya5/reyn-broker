@@ -214,53 +214,57 @@ broker は message router にすぎず、知れるのは post/drain の timestam
 session 自身だけ**。だから status の自己申告は「便利」ではなく**必然**であり、
 監視側（peer-idle-notifier 等）はそれに反応するだけで推論しない。
 
-### 両エッジを撃つ義務（active / idle）
+### 2つの直交する軸
 
-status は**遷移時のみ** `status_changed` を発火する。よって**両エッジ**を申告しないと意味を持たない:
+状態は**2軸**に分かれる。混ぜないこと:
 
-| エッジ | タイミング | status |
+| 軸 | API / CLI | 設定者 | 性質 |
+|---|---|---|---|
+| **active**（機械的） | `set_active` / `reyn-broker-active` | hook | 決定論・stall 判定の authority |
+| **status**（意味的） | `update_session_status` / `reyn-broker-status` | LLM | best-effort・enrichment |
+
+両者は独立フィールド。`set_active(false)` は status に触れず、`update_session_status`
+は active に触れない。だから Stop hook の機械的 idle が LLM の `waiting` 申告を
+**clobber しない**。
+
+### active は両エッジを撃つ義務（hook）
+
+`active_changed` は**フリップ時のみ**発火する。両エッジを hook で撃つ:
+
+| エッジ | hook | コマンド |
 |---|---|---|
-| 作業開始 | turn 開始 / 仕事を受けた直後 | `active` |
-| 作業終了 | turn を終える / 停止 / blocked | `idle`（または `waiting`）|
+| 作業開始 | UserPromptSubmit / PreToolUse | `reyn-broker-active <id> true` |
+| 作業終了 | Stop | `reyn-broker-active <id> false` |
 
-**⚠️ active を撃たないと sticky-idle トラップ**: 一度 idle と言ったきり再開時に
-active へ戻さないと、watcher は「idle のまま」と「作業再開した」を区別できず、
-永遠に idle に見える → 偽 idle で無駄な再 dispatch を招く。
+**⚠️ active=true を撃たないと sticky-idle トラップ**: 一度 false にしたきり再開時に
+true へ戻さないと、watcher は「idle のまま」と「再開した」を区別できず永遠に idle に見える。
 
 **⚠️ 再開経路の落とし穴**: broker の task-notification / wakeup 経由の再開は
-`UserPromptSubmit` hook を通らないことがある。active-edge は
+`UserPromptSubmit` hook を通らないことがある。active=true は
 **user-prompt 起点と notification/wakeup 起点の両方**でカバーすること
 （dormancy 体質の session ほどここで idle 解除し損ねやすい）。
 
-### ステップ 1: ステータスを更新する（broker に明示宣言）
+```bash
+# settings.json — 作業開始エッジ（UserPromptSubmit + wakeup 経路の両方）
+reyn-broker-active <session_id> true
+# Stop hook — 作業終了エッジ
+reyn-broker-active <session_id> false
+```
+
+### status は任意の enrichment（LLM）
+
+「何を待っているか」を伝えたい時だけ撃つ。無くても active で stall 検出は回る。
 
 ```python
-# 作業開始時
-update_session_status(session_id="<self>", status="active")
-
-# 停止時
 update_session_status(
     session_id="<self>",
-    status="idle",          # または "waiting" (blocked 時)
-    detail="done-need-review / blocked-on-<X> / pausing-resume-when-<Y>",
+    status="waiting",
+    detail="ci:#1268 / blocked-on-<X> / pausing-resume-when-<Y>",
 )
 ```
 
-Stop hook からトークン消費なしに設定する場合:
-
-```bash
-# settings.json Stop hook に設定（作業終了エッジ）
-reyn-broker-status <session_id> idle "done-need-review"
-# 作業開始エッジは UserPromptSubmit hook + wakeup 経路の両方に設定
-reyn-broker-status <session_id> active
-```
-
-### hint 層（任意・非権威）
-
-「何で待っているか」を triage 用に添えるのは可（例 `waiting_for: ci:#1268`）。
-ただしこれは **best-effort な付帯情報**であり、stall 判定の authority ではない。
-決定論的な判定は status 自己申告だけが担う。watcher 側でこの hint を使って
-独自に stall 判定してはならない（authority の誤配置）。
+これは **best-effort な付帯情報**であり stall 判定の authority ではない。watcher は
+`active` のエッジで判定し、status は「なぜ idle か」の表示にのみ使う。
 
 ### ステップ 2: backlog-watcher に stop-status を post する
 
