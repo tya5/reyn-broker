@@ -7,22 +7,29 @@ and can run periodic work via ``on_poll``.
 Implementing a plugin
 ---------------------
 Subclass :class:`BrokerPlugin`, set :attr:`session_id` / :attr:`role`, and
-override the lifecycle hooks you need. Call ``asyncio.run(MyPlugin().run())``
-in ``main()``.
+declare commands with the :func:`command` decorator. Call
+``asyncio.run(MyPlugin().run())`` in ``main()``.
 
-Minimal example::
+Example::
 
     class EchoPlugin(BrokerPlugin):
         session_id = "echo"
         role = "echo back every message"
 
-        async def on_broker_message(self, msg, broker):
-            await broker.post(to=msg["from"], message=f"echo: {msg['message']}")
+        @command(description="Echo a message back to the sender")
+        async def echo(self, text: str, broker: BrokerClient) -> str:
+            return f"echo: {text}"
 
     def main():
         asyncio.run(EchoPlugin().run())
 
-See ``plugins/ci_watcher.py`` and ``plugins/telegram.py`` for full examples.
+Commands are invoked by other sessions via ``post_message``::
+
+    post_message(to="echo", from_session="alice", message="echo:hello world")
+    # → alice receives: "echo: hello world"
+
+The broker stores the plugin's command schema at registration time.
+Other sessions can discover it via the ``get_plugin_commands`` broker tool.
 
 Lifecycle
 ---------
@@ -30,21 +37,28 @@ Lifecycle
 
     broker connects
         ↓
-    on_start(broker)          ← one-time setup
+    on_start(broker)           ← one-time setup
         ↓
-    ┌─────────────────────────────────────────┐
-    │  inbox drain loop (every inbox_interval) │  → on_broker_message per message
-    │  poll loop       (every poll_interval)   │  → on_poll
-    └─────────────────────────────────────────┘
+    ┌──────────────────────────────────────────────┐
+    │  inbox drain (every inbox_interval seconds)   │
+    │    → routes to @command handlers              │
+    │    → falls through to on_broker_message       │
+    │  poll loop  (every N seconds, if enabled)     │
+    │    → on_poll(broker)                          │
+    └──────────────────────────────────────────────┘
         ↓ (on broker disconnect)
     reconnect after reconnect_seconds, restart from on_start
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from mcp import ClientSession
@@ -54,46 +68,80 @@ logger = logging.getLogger("broker.plugin")
 
 _BROKER_URL = os.environ.get("BROKER_URL", "http://127.0.0.1:8765/mcp")
 
+# Attribute name used to mark command methods
+_COMMAND_ATTR = "_broker_command"
 
-def _parse_result(result: Any) -> Any:
-    """Extract structured content from a FastMCP ``CallToolResult``."""
-    structured = getattr(result, "structuredContent", None)
-    if isinstance(structured, dict) and "result" in structured:
-        return structured["result"]
-    parts: list[Any] = []
-    for block in getattr(result, "content", []) or []:
-        text = getattr(block, "text", None)
-        if text:
-            try:
-                parts.append(json.loads(text))
-            except json.JSONDecodeError:
-                parts.append(text)
-    return parts[0] if len(parts) == 1 else parts
 
+# ---------------------------------------------------------------------------
+# @command decorator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CommandSpec:
+    name: str
+    description: str
+    args: list[str]          # ordered positional arg names (excluding self, broker)
+    method_name: str
+
+
+def command(description: str = "", name: str = "") -> Callable:
+    """Decorator to declare a plugin method as a callable broker command.
+
+    The decorated method must have the signature::
+
+        async def my_command(self, arg1: str, arg2: str, ..., broker: BrokerClient) -> str:
+            ...
+
+    All positional parameters (except ``self`` and the final ``broker``
+    parameter) are extracted from the incoming message text.
+
+    Message format expected by callers::
+
+        post_message(to="<plugin>", ..., message="command_name:arg1 arg2 ...")
+
+    The method's return value (a string) is automatically posted back to the
+    sender.  Return ``None`` or ``""`` to suppress the auto-reply.
+
+    Parameters
+    ----------
+    description : str
+        Short description shown in ``get_plugin_commands`` output.
+    name : str
+        Override the command name (defaults to the method name).
+    """
+    def decorator(fn: Callable) -> Callable:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.keys())
+        # strip 'self' and trailing 'broker' parameter
+        arg_names = [p for p in params if p not in ("self", "broker")]
+        cmd_name = name or fn.__name__
+        setattr(fn, _COMMAND_ATTR, CommandSpec(
+            name=cmd_name,
+            description=description,
+            args=arg_names,
+            method_name=fn.__name__,
+        ))
+        return fn
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# BrokerClient
+# ---------------------------------------------------------------------------
 
 class BrokerClient:
     """The broker interface passed to every plugin lifecycle hook.
 
-    Wraps the raw MCP ``ClientSession`` so plugin authors work with
-    broker concepts directly, without knowing MCP internals.
-
-    ``from_session`` is always set to the plugin's own ``session_id``
-    automatically — you never need to pass it.
+    Wraps the raw MCP ``ClientSession`` so plugin authors interact with
+    broker concepts directly — no MCP internals, no ``from_session`` boilerplate.
 
     Polling control
     ---------------
-    Call :meth:`start_poll` / :meth:`stop_poll` from inside any hook to
-    dynamically enable or disable the ``on_poll`` callback.  For example,
-    a CI-watcher plugin can start polling only when there are watched PRs
-    and stop when the watch list is empty.
+    Call :meth:`start_poll` / :meth:`stop_poll` to dynamically enable or
+    disable the ``on_poll`` callback at runtime.
     """
 
-    def __init__(
-        self,
-        cs: ClientSession,
-        session_id: str,
-        poll_handle: _PollHandle,
-    ) -> None:
+    def __init__(self, cs: ClientSession, session_id: str, poll_handle: _PollHandle) -> None:
         self._cs = cs
         self._session_id = session_id
         self._poll = poll_handle
@@ -103,7 +151,7 @@ class BrokerClient:
     # ------------------------------------------------------------------
 
     async def post(self, to: str, message: str, **kwargs: Any) -> str:
-        """Send a message to one session. Returns broker status string."""
+        """Send a message to one session. ``from_session`` is set automatically."""
         result = await self._cs.call_tool("post_message", {
             "to": to,
             "from_session": self._session_id,
@@ -122,7 +170,7 @@ class BrokerClient:
         return str(_parse_result(result))
 
     async def list_sessions(self, compact: bool = True) -> list[dict[str, Any]]:
-        """Return registered sessions. ``compact=True`` returns id+role only."""
+        """Return registered sessions. ``compact=True`` returns id + role only."""
         result = await self._cs.call_tool("list_sessions", {"compact": compact})
         return _parse_result(result) or []
 
@@ -139,7 +187,7 @@ class BrokerClient:
     # ------------------------------------------------------------------
 
     def start_poll(self, interval: float) -> None:
-        """Enable ``on_poll`` and set its call interval (seconds).
+        """Enable ``on_poll`` and set its call interval in seconds.
 
         Safe to call even if polling is already active — updates the interval.
         """
@@ -150,11 +198,28 @@ class BrokerClient:
         self._poll.stop()
 
 
-class _PollHandle:
-    """Internal: manages the on_poll timer task."""
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
+def _parse_result(result: Any) -> Any:
+    structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict) and "result" in structured:
+        return structured["result"]
+    parts: list[Any] = []
+    for block in getattr(result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text:
+            try:
+                parts.append(json.loads(text))
+            except json.JSONDecodeError:
+                parts.append(text)
+    return parts[0] if len(parts) == 1 else parts
+
+
+class _PollHandle:
     def __init__(self) -> None:
-        self._interval: float | None = None
+        self._interval: float = 60.0
         self._active = asyncio.Event()
 
     def start(self, interval: float) -> None:
@@ -166,7 +231,7 @@ class _PollHandle:
 
     @property
     def interval(self) -> float:
-        return self._interval or 60.0
+        return self._interval
 
     @property
     def running(self) -> bool:
@@ -176,17 +241,26 @@ class _PollHandle:
         await self._active.wait()
 
 
+# ---------------------------------------------------------------------------
+# BrokerPlugin
+# ---------------------------------------------------------------------------
+
 class BrokerPlugin:
     """Abstract base class for reyn-broker plugins.
 
     Subclasses MUST set :attr:`session_id` and :attr:`role`.
 
+    Declare commands with the :func:`command` decorator. The base class
+    routes incoming messages automatically and registers the command schema
+    with the broker so other sessions can discover it via
+    ``get_plugin_commands``.
+
     Override lifecycle hooks as needed:
 
-    - :meth:`on_start` — called once after broker connection established.
-    - :meth:`on_broker_message` — called for each message in the inbox.
-    - :meth:`on_poll` — called periodically (enable via ``broker.start_poll(N)``
-      or by setting :attr:`poll_interval`).
+    - :meth:`on_start` — one-time setup after connection.
+    - :meth:`on_broker_message` — fallback for messages that don't match
+      any declared command.
+    - :meth:`on_poll` — periodic work (enable via ``broker.start_poll(N)``).
 
     Attributes
     ----------
@@ -199,7 +273,7 @@ class BrokerPlugin:
     inbox_interval : float
         Seconds between inbox drain calls (default 30).
     poll_interval : float | None
-        If set, ``on_poll`` starts automatically at this interval on startup.
+        If set, ``on_poll`` starts automatically at this interval.
         ``None`` means polling is off until ``broker.start_poll(N)`` is called.
     reconnect_seconds : float
         Wait after a connection failure before reconnecting (default 10).
@@ -213,26 +287,52 @@ class BrokerPlugin:
     reconnect_seconds: float = 10
 
     # ------------------------------------------------------------------
+    # Command introspection
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _command_specs(cls) -> list[CommandSpec]:
+        """Return all CommandSpec objects declared on this class."""
+        seen: dict[str, CommandSpec] = {}
+        for klass in reversed(cls.__mro__):
+            for attr in vars(klass).values():
+                spec = getattr(attr, _COMMAND_ATTR, None)
+                if isinstance(spec, CommandSpec):
+                    seen[spec.name] = spec
+        return list(seen.values())
+
+    def commands(self) -> list[dict[str, Any]]:
+        """Return the plugin's command schema as a list of dicts.
+
+        Each entry has ``name``, ``description``, and ``args`` (list of
+        positional argument names).  This is the format returned by the
+        ``get_plugin_commands`` broker tool.
+        """
+        return [
+            {"name": s.name, "description": s.description, "args": s.args}
+            for s in self._command_specs()
+        ]
+
+    # ------------------------------------------------------------------
     # Override in subclass
     # ------------------------------------------------------------------
 
     async def on_start(self, broker: BrokerClient) -> None:
-        """Called once after broker connection and registration.
-        Use for one-time setup (send a hello message, load initial state, etc.)."""
+        """Called once after broker connection and session registration."""
 
     async def on_broker_message(self, msg: dict[str, Any], broker: BrokerClient) -> None:
-        """Called for each message drained from this plugin's broker inbox.
+        """Fallback handler for messages that do not match any @command.
 
-        ``msg`` contains at minimum ``"from"`` and ``"message"`` keys.
+        Override to handle free-form messages or implement a custom help
+        response for unknown commands.
         """
 
     async def on_poll(self, broker: BrokerClient) -> None:
         """Called periodically while polling is active.
 
-        Enable polling by calling ``broker.start_poll(interval_seconds)`` in
-        ``on_start``, or by setting the class attribute ``poll_interval``.
-
-        Do NOT loop inside this method — the base class calls it repeatedly.
+        Do NOT loop inside — the base class calls this repeatedly.
+        Enable polling via ``broker.start_poll(interval)`` or set
+        the class attribute ``poll_interval``.
         """
 
     # ------------------------------------------------------------------
@@ -256,7 +356,16 @@ class BrokerPlugin:
                         "working_dir": os.getcwd(),
                         "role": self.role,
                     })
-                    logger.info("[%s] registered on broker", self.session_id)
+                    # Register command schema with broker for discoverability
+                    schema = self.commands()
+                    if schema:
+                        await cs.call_tool("register_plugin_commands", {
+                            "session_id": self.session_id,
+                            "commands": schema,
+                        })
+                    logger.info(
+                        "[%s] registered on broker (%d commands)", self.session_id, len(schema)
+                    )
 
                     poll_handle = _PollHandle()
                     if self.poll_interval is not None:
@@ -278,6 +387,40 @@ class BrokerPlugin:
                 )
                 await asyncio.sleep(self.reconnect_seconds)
 
+    async def _dispatch(self, msg: dict[str, Any], broker: BrokerClient) -> None:
+        """Route an incoming message to a @command handler or on_broker_message."""
+        text = msg.get("message", "").strip()
+        sender = msg.get("from", "")
+
+        # Try to match "command_name:args" or "command_name args"
+        match = re.match(r"^(\w[\w-]*)[:]\s*(.*)", text, re.DOTALL) or \
+                re.match(r"^(\w[\w-]*)\s+(.*)", text, re.DOTALL) or \
+                re.match(r"^(\w[\w-]*)$", text)
+
+        cmd_name = match.group(1) if match else None
+        rest = (match.group(2).strip() if match and match.lastindex >= 2 else "")
+
+        for spec in self._command_specs():
+            if spec.name != cmd_name:
+                continue
+            method = getattr(self, spec.method_name)
+            # Split rest into positional args; fill missing with ""
+            raw_args = rest.split(None, len(spec.args) - 1) if rest else []
+            raw_args += [""] * (len(spec.args) - len(raw_args))
+            call_args = raw_args[:len(spec.args)]
+            try:
+                reply = await method(*call_args, broker=broker)
+                if reply and sender:
+                    await broker.post(to=sender, message=str(reply))
+            except Exception as exc:
+                logger.warning("[%s] command '%s' error: %s", self.session_id, cmd_name, exc)
+                if sender:
+                    await broker.post(to=sender, message=f"error in '{cmd_name}': {exc}")
+            return
+
+        # No command matched — fall through to on_broker_message
+        await self.on_broker_message(msg, broker)
+
     async def _inbox_loop(self, broker: BrokerClient, cs: ClientSession) -> None:
         while True:
             await asyncio.sleep(self.inbox_interval)
@@ -290,11 +433,9 @@ class BrokerPlugin:
                 if isinstance(msgs, list):
                     for msg in msgs:
                         try:
-                            await self.on_broker_message(msg, broker)
+                            await self._dispatch(msg, broker)
                         except Exception as exc:
-                            logger.warning(
-                                "[%s] on_broker_message error: %s", self.session_id, exc
-                            )
+                            logger.warning("[%s] dispatch error: %s", self.session_id, exc)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

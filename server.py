@@ -63,6 +63,8 @@ class PluginEntry:
 sessions: dict[str, SessionEntry] = {}
 pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
 plugins: dict[str, PluginEntry] = {}
+# session_id → list of command dicts ({name, description, args})
+plugin_commands: dict[str, list[dict[str, Any]]] = {}
 registry_lock = asyncio.Lock()
 # Live asyncio subprocess handles (not persisted — lost on broker restart)
 _plugin_procs: dict[str, Any] = {}
@@ -726,6 +728,60 @@ async def set_monitor_session(session_id: str | None = None) -> str:
     if _MONITOR_SID:
         return f"monitor enabled: all messages copied to '{_MONITOR_SID}'"
     return "monitor disabled"
+
+
+# ---------------------------------------------------------------------------
+# Plugin command registry tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def register_plugin_commands(
+    session_id: str,
+    commands: list[dict[str, Any]],
+) -> str:
+    """Register a plugin's command schema with the broker.
+
+    Called automatically by :class:`BrokerPlugin` on startup — plugin
+    authors do not need to call this directly.
+
+    ``commands`` is a list of dicts with keys ``name``, ``description``,
+    and ``args`` (list of positional argument names).
+    """
+    _tool_call_counts["register_plugin_commands"] += 1
+    plugin_commands[session_id] = commands
+    return f"registered {len(commands)} command(s) for '{session_id}'"
+
+
+@mcp.tool()
+async def get_plugin_commands(session_id: str) -> list[dict[str, Any]]:
+    """Return the command schema for a plugin session.
+
+    Use this to discover what commands a plugin accepts before sending
+    it a message.  Returns an empty list if the session has not registered
+    any commands (e.g. it is a plain broker session, not a plugin).
+
+    Each entry has:
+    - ``name``        — command name used as the message prefix.
+    - ``description`` — short description of what the command does.
+    - ``args``        — ordered list of positional argument names.
+
+    Example::
+
+        get_plugin_commands("github-ci")
+        # → [
+        #     {"name": "watch",   "args": ["pr_number"], "description": "Watch a PR"},
+        #     {"name": "unwatch", "args": ["pr_number"], "description": "Stop watching"},
+        #     {"name": "list",    "args": [],            "description": "List watched PRs"},
+        #   ]
+
+    To invoke a command, send a message in the format
+    ``"<name>:<arg1> <arg2> ..."``:
+
+        post_message(to="github-ci", from_session="me", message="watch:#1268")
+    """
+    _tool_call_counts["get_plugin_commands"] += 1
+    return plugin_commands.get(session_id, [])
 
 
 # ---------------------------------------------------------------------------

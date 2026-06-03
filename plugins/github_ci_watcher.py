@@ -50,9 +50,8 @@ import logging
 import os
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any
 
-from plugin_base import BrokerClient, BrokerPlugin
+from plugin_base import BrokerClient, BrokerPlugin, command
 
 logger = logging.getLogger("broker.plugin.ci_watcher")
 
@@ -101,40 +100,33 @@ class CiWatcherPlugin(BrokerPlugin):
         self._watched: dict[str, WatchedPR] = {}
         self._lock = asyncio.Lock()
 
-    async def on_broker_message(self, msg: dict[str, Any], broker: BrokerClient) -> None:
-        """Handle watch/unwatch/list commands from other sessions."""
-        text = msg.get("message", "").strip()
-        requester = msg.get("from", "")
+    @command(description="Start watching a PR's GitHub Actions checks")
+    async def watch(self, pr_number: str, broker: BrokerClient) -> str:
+        async with self._lock:
+            if pr_number not in self._watched:
+                self._watched[pr_number] = WatchedPR(pr_number=pr_number)
+            self._watched[pr_number].requesters.add(broker._session_id)
+            if not broker._poll.running:
+                broker.start_poll(_CI_POLL_S)
+        logger.info("watching PR #%s", pr_number)
+        return f"watching PR #{pr_number} (poll every {_CI_POLL_S}s)"
 
-        if text.startswith("watch:#"):
-            pr_num = text[7:].strip()
-            async with self._lock:
-                if pr_num not in self._watched:
-                    self._watched[pr_num] = WatchedPR(pr_number=pr_num)
-                self._watched[pr_num].requesters.add(requester)
-                if not broker._poll.running:
-                    broker.start_poll(_CI_POLL_S)
-            logger.info("watching PR #%s for %s", pr_num, requester)
-            await broker.post(
-                to=requester,
-                message=f"CI watching: PR #{pr_num} (poll every {_CI_POLL_S}s)",
-            )
+    @command(description="Stop watching a PR's GitHub Actions checks")
+    async def unwatch(self, pr_number: str, broker: BrokerClient) -> str:
+        async with self._lock:
+            if pr_number in self._watched:
+                self._watched[pr_number].requesters.discard(broker._session_id)
+                if not self._watched[pr_number].requesters:
+                    del self._watched[pr_number]
+            if not self._watched:
+                broker.stop_poll()
+        return f"unwatched PR #{pr_number}"
 
-        elif text.startswith("unwatch:#"):
-            pr_num = text[9:].strip()
-            async with self._lock:
-                if pr_num in self._watched:
-                    self._watched[pr_num].requesters.discard(requester)
-                    if not self._watched[pr_num].requesters:
-                        del self._watched[pr_num]
-                if not self._watched:
-                    broker.stop_poll()
-            await broker.post(to=requester, message=f"CI unwatched: PR #{pr_num}")
-
-        elif text == "list":
-            async with self._lock:
-                watching = list(self._watched.keys())
-            await broker.post(to=requester, message=f"CI watching: {watching or 'none'}")
+    @command(description="List all currently watched PRs")
+    async def list(self, broker: BrokerClient) -> str:
+        async with self._lock:
+            watching = list(self._watched.keys())
+        return f"watching: {watching or 'none'}"
 
     async def on_poll(self, broker: BrokerClient) -> None:
         """Check CI status for all watched PRs and notify requesters on change."""
