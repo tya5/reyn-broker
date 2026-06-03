@@ -80,10 +80,14 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
   session to re-initialize the MCP connection from scratch.
   **Prevention:** broker releases that change tool signatures are noted in CHANGELOG as
   requiring a session-side schema refresh.
-- **Upgrading to a version with renamed tools** (e.g. 0.13.x → 0.14.0 where
-  `plugin_add` became `add_plugin`) — `ToolSearch` partial refresh is not sufficient
-  because old tool names disappear entirely. **Restart all Claude Code sessions**
-  after upgrading to ensure clean schema state.
+- **Upgrading to a version with renamed OR newly-added tools** (e.g. 0.13.x →
+  0.14.0 renamed `plugin_add` → `add_plugin`; 0.15.0 added `set_active`) — a
+  connected session caches the tool list from when it connected, so it cannot
+  see added tools and still sees removed names. `ToolSearch` does **not** help:
+  it searches the cached list, so a newly-added tool (e.g. `set_active`) never
+  resolves. **Restart all Claude Code sessions** after such an upgrade to get a
+  clean schema. (CLI entry points like `reyn-broker-active` open their own
+  connection and are unaffected — hooks keep working across upgrades.)
 
 ## MCP tools
 
