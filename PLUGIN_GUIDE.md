@@ -257,6 +257,30 @@ await broker.subscribe_events(
 
 イベントは `on_broker_message` の `msg` として届きます。`session_filter` で監視対象を絞れます。詳細は [イベントリファレンス](#セッションイベントリファレンス) を参照。
 
+### stall/idle 検出の大原則（必読）
+
+監視プラグインを書く前に理解しておくべき設計原則:
+
+> **broker は stall/idle を決定論的に判断できない。** broker は message router
+> にすぎず、知れるのは post/drain の timestamp だけ。「無 post N 分 = idle」は
+> 非決定論的な当て推量（長い正計算で静かなだけ / 真に stuck / 人間待ち を区別
+> 不能）。**自分の状態を決定論的に知るのは session 自身だけ。**
+
+したがって監視プラグインの正しい形は「**session の自己申告（`status_changed`）に
+反応するだけ。watcher 側で推論しない**」。これは broker の "broker=hint,
+contract=決定論" 哲学と同型。
+
+**前提となる session 側の責務**（SESSION_GUIDE §4.5）:
+- 各 session は **両エッジ**を申告する義務を負う —
+  作業開始 → `active`、作業終了/停止 → `idle`。
+- Stop hook から `reyn-broker-status <id> idle` を撃つ（LLM turn 不要の one-shot CLI）。
+- active-edge は user-prompt 起点と **wakeup 起点の両方**でカバーする
+  （さもないと dormancy 体質の session が再開時に idle 解除し損ねる）。
+
+この責務が満たされて初めて、下記の idle notifier が「なぜ `status_changed`
+購読だけで閉じるか」が成立する。`waiting_for` のような「何で待っているか」は
+session が申告に添える **任意の hint** に留め、watcher 側で stall 判定に使わない。
+
 ### peer idle notifier での活用例
 
 セッションが `update_session_status(..., status="idle")` を呼んだ瞬間に検知して通知します。ポーリング不要・タイマー不要。

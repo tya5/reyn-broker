@@ -202,19 +202,46 @@ receive_messages(session_id="<自分の session_id>", fields=["from", "message"]
 
 ---
 
-## 4.5. MANDATORY notify-on-stop（必須プロトコル）
+## 4.5. MANDATORY status protocol（必須プロトコル）
 
 > **⚠️ silent stop（status なしで turn 終了）= protocol 違反**
 
-turn を終える / 停止 / pause / blocked / hand-off / context 切れ が発生する場合、
-以下の **2 ステップ** を停止前の最後のアクションとして実行すること。
+### 大原則: stall/idle は session だけが知る決定論的事実
+
+broker は message router にすぎず、知れるのは post/drain の timestamp だけ。
+「無 post N 分 = idle」は**非決定論的な当て推量**で、長い正計算で静かなだけ /
+真に stuck / 人間待ち を外部から区別できない。**自分の状態を決定論的に知るのは
+session 自身だけ**。だから status の自己申告は「便利」ではなく**必然**であり、
+監視側（peer-idle-notifier 等）はそれに反応するだけで推論しない。
+
+### 両エッジを撃つ義務（active / idle）
+
+status は**遷移時のみ** `status_changed` を発火する。よって**両エッジ**を申告しないと意味を持たない:
+
+| エッジ | タイミング | status |
+|---|---|---|
+| 作業開始 | turn 開始 / 仕事を受けた直後 | `active` |
+| 作業終了 | turn を終える / 停止 / blocked | `idle`（または `waiting`）|
+
+**⚠️ active を撃たないと sticky-idle トラップ**: 一度 idle と言ったきり再開時に
+active へ戻さないと、watcher は「idle のまま」と「作業再開した」を区別できず、
+永遠に idle に見える → 偽 idle で無駄な再 dispatch を招く。
+
+**⚠️ 再開経路の落とし穴**: broker の task-notification / wakeup 経由の再開は
+`UserPromptSubmit` hook を通らないことがある。active-edge は
+**user-prompt 起点と notification/wakeup 起点の両方**でカバーすること
+（dormancy 体質の session ほどここで idle 解除し損ねやすい）。
 
 ### ステップ 1: ステータスを更新する（broker に明示宣言）
 
 ```python
+# 作業開始時
+update_session_status(session_id="<self>", status="active")
+
+# 停止時
 update_session_status(
-    session_id="<自分の session_id>",
-    status="idle",          # または "waiting" (blocked 時) など
+    session_id="<self>",
+    status="idle",          # または "waiting" (blocked 時)
     detail="done-need-review / blocked-on-<X> / pausing-resume-when-<Y>",
 )
 ```
@@ -222,9 +249,18 @@ update_session_status(
 Stop hook からトークン消費なしに設定する場合:
 
 ```bash
-# settings.json Stop hook に設定
+# settings.json Stop hook に設定（作業終了エッジ）
 reyn-broker-status <session_id> idle "done-need-review"
+# 作業開始エッジは UserPromptSubmit hook + wakeup 経路の両方に設定
+reyn-broker-status <session_id> active
 ```
+
+### hint 層（任意・非権威）
+
+「何で待っているか」を triage 用に添えるのは可（例 `waiting_for: ci:#1268`）。
+ただしこれは **best-effort な付帯情報**であり、stall 判定の authority ではない。
+決定論的な判定は status 自己申告だけが担う。watcher 側でこの hint を使って
+独自に stall 判定してはならない（authority の誤配置）。
 
 ### ステップ 2: backlog-watcher に stop-status を post する
 
