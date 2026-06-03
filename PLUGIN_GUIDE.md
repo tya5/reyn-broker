@@ -419,7 +419,7 @@ post_message(to="github-ci", from_session="me", message="list")
 
 セッションの活動を `subscribe_session_events` でリアルタイム追跡し、一定時間沈黙しているセッションを検出して通知します。`list_sessions` ポーリング不要。
 
-環境変数: `PEER_STALL_THRESHOLD_S`（デフォルト 900s）、`PEER_STALL_NOTIFY`（デフォルト `backlog-watcher`）、`PEER_STALL_EXCLUDE`（除外セッション、カンマ区切り）
+環境変数: `PEER_STALL_THRESHOLD_S`（デフォルト 900s）、`PEER_STALL_NOTIFY`（デフォルト `backlog-watcher`）、`PEER_STALL_WATCH`（監視対象セッション、カンマ区切り。未設定時は broker と self 以外を全監視）
 
 ```python
 plugin_add(

@@ -13,8 +13,8 @@ Environment variables
 PEER_STALL_POLL_S        Staleness check interval in seconds (default: 60)
 PEER_STALL_THRESHOLD_S   Silence threshold in seconds (default: 900)
 PEER_STALL_NOTIFY        Target session for alerts (default: backlog-watcher)
-PEER_STALL_EXCLUDE       Comma-separated extra session ids to exclude
-                         (broker and peer-stall-watcher are always excluded)
+PEER_STALL_WATCH         Comma-separated session ids to monitor.
+                         If unset, all sessions except broker and self are watched.
 """
 from __future__ import annotations
 
@@ -32,7 +32,11 @@ logger = logging.getLogger("broker.plugin.peer_stall_watcher")
 _POLL_S = int(os.environ.get("PEER_STALL_POLL_S", "60"))
 _STALL_THRESHOLD_S = int(os.environ.get("PEER_STALL_THRESHOLD_S", "900"))
 _NOTIFY_TARGET = os.environ.get("PEER_STALL_NOTIFY", "backlog-watcher")
-_EXCLUDE_EXTRA = set(filter(None, os.environ.get("PEER_STALL_EXCLUDE", "").split(",")))
+# Explicit watch list — if set, only these sessions are monitored.
+# If unset/empty, all sessions except broker and self are monitored.
+_WATCH_LIST: frozenset[str] | None = (
+    frozenset(filter(None, os.environ.get("PEER_STALL_WATCH", "").split(","))) or None
+)
 
 
 class PeerStallWatcher(BrokerPlugin):
@@ -42,7 +46,13 @@ class PeerStallWatcher(BrokerPlugin):
 
     def __init__(self) -> None:
         self._last_seen: dict[str, datetime] = {}
-        self._exclude = {"broker", self.session_id} | _EXCLUDE_EXTRA
+
+    def _should_watch(self, sid: str) -> bool:
+        if sid in {"broker", self.session_id}:
+            return False
+        if _WATCH_LIST is not None:
+            return sid in _WATCH_LIST
+        return True
 
     async def on_start(self, broker: BrokerClient) -> None:
         # Seed last_seen from current session state (one-time snapshot at startup)
@@ -51,7 +61,7 @@ class PeerStallWatcher(BrokerPlugin):
         if isinstance(sessions, list):
             for s in sessions:
                 sid = s.get("session_id", "")
-                if sid in self._exclude:
+                if not self._should_watch(sid):
                     continue
                 last_post = s.get("last_post_at")
                 if last_post:
@@ -68,7 +78,7 @@ class PeerStallWatcher(BrokerPlugin):
     async def on_broker_message(self, msg: dict[str, Any], broker: BrokerClient) -> None:
         event = msg.get("event")
         sid = msg.get("session_id", "")
-        if not event or not sid or sid in self._exclude:
+        if not event or not sid or not self._should_watch(sid):
             return
 
         if event == "posted":
