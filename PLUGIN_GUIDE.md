@@ -387,6 +387,13 @@ reyn-broker-myplugin = "plugins.my_plugin:main"
 my-plugin = "my_package.plugin:MyPlugin"
 ```
 
+> **import パスについて**: `from plugin_base import ...`（§最小プラグインの実装）は
+> `plugin_base` が top-level モジュールとして import 可能であることが前提です。
+> reyn-broker 同梱プラグイン（`plugins/` 配下）は broker ルートが `sys.path` に
+> 入った状態で起動されるため top-level import が解決します。**独立パッケージ**として
+> 配布する場合は `reyn-broker` を依存に加え、`from plugin_base import ...` が解決する
+> 環境で起動してください（または自パッケージ内に同等の基底を持つ）。
+
 ---
 
 ## broker へのプラグイン登録・起動
