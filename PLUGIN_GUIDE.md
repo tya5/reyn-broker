@@ -14,10 +14,11 @@ Telegram ブリッジや GitHub CI ウォッチャーのように、**外部サ�
 4. [BrokerClient リファレンス](#brokerclient-リファレンス)
 5. [BrokerPlugin リファレンス](#brokerplugin-リファレンス)
 6. [セッションイベント購読](#セッションイベント購読)
-7. [プラグインのパッケージング](#プラグインのパッケージング)
-8. [broker へのプラグイン登録・起動](#broker-へのプラグイン登録起動)
-9. [バンドルプラグイン](#バンドルプラグイン)
-10. [設計原則](#設計原則)
+7. [セッションイベントリファレンス](#セッションイベントリファレンス)
+8. [プラグインのパッケージング](#プラグインのパッケージング)
+9. [broker へのプラグイン登録・起動](#broker-へのプラグイン登録起動)
+10. [バンドルプラグイン](#バンドルプラグイン)
+11. [設計原則](#設計原則)
 
 ---
 
@@ -175,14 +176,14 @@ await broker.subscribe_events(
 
 `list_sessions` ポーリングの代わりにイベント購読を使うことでブローカー負荷を下げられます。イベントは `on_broker_message` に届きます（`msg.get("event")` でイベント種別を確認）。
 
-利用可能なイベント種別:
+利用可能なイベント種別とペイロード（→ [イベントリファレンス](#セッションイベントリファレンス) 参照）:
 
 | イベント | トリガー |
 |---|---|
-| `registered` | `register_session` / `startup_summary` が呼ばれた |
-| `unregistered` | `unregister_session` が呼ばれた / TTL 期限切れ |
-| `posted` | `post_message` / `broadcast_message` が呼ばれた |
-| `status_changed` | `update_session_status` が呼ばれた |
+| `registered` | `register_session` / `startup_summary` |
+| `unregistered` | `unregister_session` / TTL 期限切れ |
+| `posted` | `post_message` / `broadcast_message` |
+| `status_changed` | `update_session_status`（変化時のみ） |
 
 ### ポーリング制御
 
@@ -247,28 +248,14 @@ async def on_poll(self, broker: BrokerClient) -> None:
 broker の `subscribe_session_events` を使うと、セッションの活動変化を inbox 経由で受け取れます。`list_sessions` のポーリングが不要になります。
 
 ```python
-# 購読（broker MCP ツールを直接呼ぶ）
-subscribe_session_events(
-    subscriber_id="my-plugin",
-    event_types=["registered", "unregistered", "posted"],
+# on_start で購読登録（BrokerClient 経由）
+await broker.subscribe_events(
+    event_types=["registered", "unregistered", "posted", "status_changed"],
     session_filter=None,  # None = 全セッション
 )
 ```
 
-届くメッセージ形式:
-```json
-{"from": "broker", "event": "posted", "session_id": "lead-coder", "at": "2026-06-03T..."}
-```
-
-`session_filter` で監視対象を絞れます。除外したいセッション（broker/telegram 等）は subscriber 側でフィルタします。
-
-イベントタイプ:
-
-| イベント | トリガー |
-|---|---|
-| `registered` | `register_session` / `startup_summary` が呼ばれた |
-| `unregistered` | `unregister_session` が呼ばれた / TTL 期限切れ |
-| `posted` | `post_message` / `broadcast_message` が呼ばれた |
+イベントは `on_broker_message` の `msg` として届きます。`session_filter` で監視対象を絞れます。詳細は [イベントリファレンス](#セッションイベントリファレンス) を参照。
 
 ### peer idle notifier での活用例
 
@@ -292,6 +279,60 @@ class PeerIdleNotifier(BrokerPlugin):
                 message=f"PEER_IDLE: {sid} is ready for new work",
             )
 ```
+
+---
+
+## セッションイベントリファレンス
+
+イベントは `on_broker_message` の `msg` dict として届きます。全イベント共通フィールド: `from`（常に `"broker"`）、`event`、`session_id`、`at`（ISO-8601 UTC）。
+
+### `registered`
+
+| フィールド | 値 |
+|---|---|
+| `event` | `"registered"` |
+| `session_id` | 登録されたセッション ID |
+| `at` | 登録時刻 |
+
+**トリガー**: `register_session` または `startup_summary` が呼ばれたとき。
+
+---
+
+### `unregistered`
+
+| フィールド | 値 |
+|---|---|
+| `event` | `"unregistered"` |
+| `session_id` | 削除されたセッション ID |
+| `at` | 削除時刻 |
+
+**トリガー**: `unregister_session` が呼ばれたとき、または TTL 期限切れで自動削除されたとき。
+
+---
+
+### `posted`
+
+| フィールド | 値 |
+|---|---|
+| `event` | `"posted"` |
+| `session_id` | 送信したセッション ID（`from_session`）|
+| `at` | 送信時刻 |
+
+**トリガー**: `post_message` または `broadcast_message` が呼ばれたとき。
+
+---
+
+### `status_changed`
+
+| フィールド | 値 |
+|---|---|
+| `event` | `"status_changed"` |
+| `session_id` | 状態を更新したセッション ID |
+| `status` | 新しいステータス文字列（`"active"` / `"idle"` / `"waiting"` など）|
+| `detail` | 任意の補足説明（`None` の場合あり）|
+| `at` | 更新時刻 |
+
+**トリガー**: `update_session_status` が呼ばれ、かつ status または detail が変化したとき（before == after の場合はイベント発火なし）。
 
 ---
 
