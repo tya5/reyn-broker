@@ -119,7 +119,7 @@ async def threshold(self, session_id: str, seconds: str, broker: BrokerClient) -
 他セッションはコマンド体系を問い合わせできます:
 
 ```python
-get_plugin_commands("echo")
+list_plugin_commands("echo")
 # → [{"name": "echo", "description": "Echo a message back", "args": ["text"]}]
 ```
 
@@ -371,7 +371,7 @@ broker MCP 経由でプラグインを動的に管理できます（再起動不
 
 ```python
 # 登録
-plugin_add(
+add_plugin(
     name="my-plugin",
     command="/path/to/.venv/bin/python /path/to/my_plugin.py",
     session_id="my-plugin",
@@ -380,13 +380,13 @@ plugin_add(
 )
 
 # 起動・停止・再起動・削除
-plugin_start("my-plugin")
-plugin_stop("my-plugin")
-plugin_restart("my-plugin")
-plugin_remove("my-plugin")
+start_plugin("my-plugin")
+stop_plugin("my-plugin")
+restart_plugin("my-plugin")
+remove_plugin("my-plugin")
 
 # 状態確認
-plugin_list()
+list_plugins()
 # → [{"name": "my-plugin", "pid": 12345, "running": True, "connected": True, ...}]
 ```
 
@@ -417,7 +417,7 @@ plugin_list()
 必要な環境変数: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 
 ```python
-plugin_add(
+add_plugin(
     name="telegram",
     command="/path/to/.venv/bin/reyn-broker-telegram",
     session_id="telegram",
@@ -432,7 +432,7 @@ GitHub PR のチェック結果（GitHub Actions）を監視し、状態変化�
 必要条件: `gh` CLI がインストールされ認証済み (`gh auth login`)
 
 ```python
-plugin_add(
+add_plugin(
     name="github-ci",
     command="/path/to/.venv/bin/reyn-broker-github-ci",
     session_id="github-ci",
@@ -457,7 +457,7 @@ post_message(to="github-ci", from_session="me", message="list")
 環境変数: `PEER_IDLE_NOTIFY`（デフォルト `backlog-watcher`）、`PEER_IDLE_WATCH`（監視対象セッション）、`PEER_IDLE_STATES`（デフォルト `idle`）
 
 ```python
-plugin_add(
+add_plugin(
     name="peer-stall-watcher",
     command="/path/to/.venv/bin/reyn-broker-peer-stall",
     session_id="peer-stall-watcher",
@@ -472,7 +472,7 @@ GitHub PR の open/merged/closed と mergeStateStatus (CLEAN/DIRTY) の変化を
 必要条件: `gh` CLI がインストールされ認証済み
 
 ```python
-plugin_add(
+add_plugin(
     name="github-pr-watcher",
     command="/path/to/.venv/bin/reyn-broker-github-pr",
     session_id="github-pr-watcher",

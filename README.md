@@ -99,11 +99,11 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `subscribe_session_events` | `subscriber_id`, `event_types`, `session_filter?` | Push session lifecycle events (`registered`, `unregistered`, `posted`, `status_changed`) into the subscriber's inbox. |
 | `unsubscribe_session_events` | `subscriber_id`                          | Cancel an event subscription.                                                   |
 | `tool_stats`        | *(none)*                                        | Return per-tool call counts since broker start. Useful for token-cost analysis. |
-| `plugin_add`        | `name`, `command`, `session_id`, `env?`, `auto_start?` | Register and optionally auto-start a plugin subprocess.                   |
-| `plugin_start` / `plugin_stop` / `plugin_restart` / `plugin_remove` | `name` | Manage plugin lifecycle without broker restart. |
-| `plugin_list`       | *(none)*                                        | List registered plugins with running state and PID.                             |
-| `register_plugin_commands` | `session_id`, `commands`               | Register a plugin's command schema for discoverability via `get_plugin_commands`. |
-| `get_plugin_commands` | `session_id`                                  | Retrieve a plugin's declared command schema.                                    |
+| `add_plugin`        | `name`, `command`, `session_id`, `env?`, `auto_start?` | Register and optionally auto-start a plugin subprocess.                   |
+| `start_plugin` / `stop_plugin` / `restart_plugin` / `remove_plugin` | `name` | Manage plugin lifecycle without broker restart. |
+| `list_plugins`       | *(none)*                                        | List registered plugins with running state and PID.                             |
+| `register_plugin_commands` | `session_id`, `commands`               | Register a plugin's command schema for discoverability via `list_plugin_commands`. |
+| `list_plugin_commands` | `session_id`                                  | Retrieve a plugin's declared command schema.                                    |
 | `health_check`      | *(none)*                                        | Returns `version`, `started_at_iso`, `uptime_seconds`, `session_count`, `total_pending`. |
 
 `role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so

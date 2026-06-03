@@ -29,7 +29,7 @@ Commands are invoked by other sessions via ``post_message``::
     # → alice receives: "echo: hello world"
 
 The broker stores the plugin's command schema at registration time.
-Other sessions can discover it via the ``get_plugin_commands`` broker tool.
+Other sessions can discover it via the ``list_plugin_commands`` broker tool.
 
 Lifecycle
 ---------
@@ -115,7 +115,7 @@ def command(description: str = "", name: str = "") -> Callable:
     Parameters
     ----------
     description : str
-        Short description shown in ``get_plugin_commands`` output.
+        Short description shown in ``list_plugin_commands`` output.
     name : str
         Override the command name (defaults to the method name).
     """
@@ -303,7 +303,7 @@ class BrokerPlugin:
     Declare commands with the :func:`command` decorator. The base class
     routes incoming messages automatically and registers the command schema
     with the broker so other sessions can discover it via
-    ``get_plugin_commands``.
+    ``list_plugin_commands``.
 
     Override lifecycle hooks as needed:
 
@@ -356,7 +356,7 @@ class BrokerPlugin:
 
         Each entry has ``name``, ``description``, and ``args`` (list of
         positional argument names).  This is the format returned by the
-        ``get_plugin_commands`` broker tool.
+        ``list_plugin_commands`` broker tool.
         """
         return [
             {"name": s.name, "description": s.description, "args": s.args}

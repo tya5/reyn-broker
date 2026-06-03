@@ -10,7 +10,7 @@ Usage
 -----
 Register via broker MCP::
 
-    plugin_add(
+    add_plugin(
         name="github-pr-watcher",
         command="/path/to/.venv/bin/reyn-broker-github-pr",
         session_id="github-pr-watcher",

@@ -1185,17 +1185,17 @@ async def test_tool_stats_returns_counts(broker_url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_plugin_add_and_list(broker_url: str) -> None:
-    """plugin_add registers a plugin; plugin_list returns it."""
+async def test_add_plugin_and_list(broker_url: str) -> None:
+    """add_plugin registers a plugin; list_plugins returns it."""
     async with _client(broker_url) as c:
-        add_result = _payload(await c.call_tool("plugin_add", {
+        add_result = _payload(await c.call_tool("add_plugin", {
             "name": "test-plugin",
             "command": "sleep 30",
             "session_id": "test-plugin",
         }))
         assert "registered" in add_result
 
-        plugins = _payload(await c.call_tool("plugin_list", {}))
+        plugins = _payload(await c.call_tool("list_plugins", {}))
         entry = next((p for p in plugins if p["name"] == "test-plugin"), None)
         assert entry is not None
         assert entry["session_id"] == "test-plugin"
@@ -1205,90 +1205,90 @@ async def test_plugin_add_and_list(broker_url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_plugin_add_duplicate_rejected(broker_url: str) -> None:
+async def test_add_plugin_duplicate_rejected(broker_url: str) -> None:
     async with _client(broker_url) as c:
-        await c.call_tool("plugin_add", {
+        await c.call_tool("add_plugin", {
             "name": "p1", "command": "sleep 1", "session_id": "p1",
         })
-        result = _payload(await c.call_tool("plugin_add", {
+        result = _payload(await c.call_tool("add_plugin", {
             "name": "p1", "command": "sleep 1", "session_id": "p1",
         }))
         assert "already registered" in result
 
 
 @pytest.mark.asyncio
-async def test_plugin_remove(broker_url: str) -> None:
+async def test_remove_plugin(broker_url: str) -> None:
     async with _client(broker_url) as c:
-        await c.call_tool("plugin_add", {
+        await c.call_tool("add_plugin", {
             "name": "to-remove", "command": "sleep 1", "session_id": "to-remove",
         })
-        remove_result = _payload(await c.call_tool("plugin_remove", {"name": "to-remove"}))
+        remove_result = _payload(await c.call_tool("remove_plugin", {"name": "to-remove"}))
         assert "removed" in remove_result
 
-        plugins = _payload(await c.call_tool("plugin_list", {}))
+        plugins = _payload(await c.call_tool("list_plugins", {}))
         assert not any(p["name"] == "to-remove" for p in plugins)
 
 
 @pytest.mark.asyncio
-async def test_plugin_remove_unknown(broker_url: str) -> None:
+async def test_remove_plugin_unknown(broker_url: str) -> None:
     async with _client(broker_url) as c:
-        result = _payload(await c.call_tool("plugin_remove", {"name": "ghost"}))
+        result = _payload(await c.call_tool("remove_plugin", {"name": "ghost"}))
         assert "not found" in result
 
 
 @pytest.mark.asyncio
-async def test_plugin_start_and_stop(broker_url: str) -> None:
-    """plugin_start spawns a process; plugin_stop terminates it."""
+async def test_start_plugin_and_stop(broker_url: str) -> None:
+    """start_plugin spawns a process; stop_plugin terminates it."""
     import asyncio as _asyncio
     import sys
 
     cmd = f"{sys.executable} -c \"import time; time.sleep(30)\""
     async with _client(broker_url) as c:
-        await c.call_tool("plugin_add", {
+        await c.call_tool("add_plugin", {
             "name": "sleeper", "command": cmd, "session_id": "sleeper",
         })
-        start_result = _payload(await c.call_tool("plugin_start", {"name": "sleeper"}))
+        start_result = _payload(await c.call_tool("start_plugin", {"name": "sleeper"}))
         assert "started" in start_result
 
         await _asyncio.sleep(0.5)
-        plugins = _payload(await c.call_tool("plugin_list", {}))
+        plugins = _payload(await c.call_tool("list_plugins", {}))
         entry = next(p for p in plugins if p["name"] == "sleeper")
         assert entry["running"] is True
         assert entry["pid"] is not None
 
-        stop_result = _payload(await c.call_tool("plugin_stop", {"name": "sleeper"}))
+        stop_result = _payload(await c.call_tool("stop_plugin", {"name": "sleeper"}))
         assert "stopped" in stop_result
 
         await _asyncio.sleep(0.5)
-        plugins2 = _payload(await c.call_tool("plugin_list", {}))
+        plugins2 = _payload(await c.call_tool("list_plugins", {}))
         entry2 = next(p for p in plugins2 if p["name"] == "sleeper")
         assert entry2["running"] is False
 
 
 @pytest.mark.asyncio
-async def test_plugin_restart(broker_url: str) -> None:
+async def test_restart_plugin(broker_url: str) -> None:
     import asyncio as _asyncio
     import sys
 
     cmd = f"{sys.executable} -c \"import time; time.sleep(30)\""
     async with _client(broker_url) as c:
-        await c.call_tool("plugin_add", {
+        await c.call_tool("add_plugin", {
             "name": "restarter", "command": cmd, "session_id": "restarter",
         })
-        await c.call_tool("plugin_start", {"name": "restarter"})
+        await c.call_tool("start_plugin", {"name": "restarter"})
         await _asyncio.sleep(0.3)
-        plugins_before = {p["name"]: p for p in _payload(await c.call_tool("plugin_list", {}))}
+        plugins_before = {p["name"]: p for p in _payload(await c.call_tool("list_plugins", {}))}
         pid_before = plugins_before["restarter"]["pid"]
 
-        await c.call_tool("plugin_restart", {"name": "restarter"})
+        await c.call_tool("restart_plugin", {"name": "restarter"})
         await _asyncio.sleep(0.5)
-        plugins_after = {p["name"]: p for p in _payload(await c.call_tool("plugin_list", {}))}
+        plugins_after = {p["name"]: p for p in _payload(await c.call_tool("list_plugins", {}))}
         pid_after = plugins_after["restarter"]["pid"]
 
         assert plugins_after["restarter"]["running"] is True
         assert pid_after != pid_before  # new process spawned
 
-        await c.call_tool("plugin_stop", {"name": "restarter"})
+        await c.call_tool("stop_plugin", {"name": "restarter"})
 
 
 @pytest.mark.asyncio

@@ -918,7 +918,7 @@ async def register_plugin_commands(
 
 
 @mcp.tool()
-async def get_plugin_commands(session_id: str) -> list[dict[str, Any]]:
+async def list_plugin_commands(session_id: str) -> list[dict[str, Any]]:
     """Return the command schema for a plugin session.
 
     Use this to discover what commands a plugin accepts before sending
@@ -932,7 +932,7 @@ async def get_plugin_commands(session_id: str) -> list[dict[str, Any]]:
 
     Example::
 
-        get_plugin_commands("github-ci")
+        list_plugin_commands("github-ci")
         # → [
         #     {"name": "watch",   "args": ["pr_number"], "description": "Watch a PR"},
         #     {"name": "unwatch", "args": ["pr_number"], "description": "Stop watching"},
@@ -944,7 +944,7 @@ async def get_plugin_commands(session_id: str) -> list[dict[str, Any]]:
 
         post_message(to="github-ci", from_session="me", message="watch:#1268")
     """
-    _tool_call_counts["get_plugin_commands"] += 1
+    _tool_call_counts["list_plugin_commands"] += 1
     return plugin_commands.get(session_id, [])
 
 
@@ -1045,7 +1045,7 @@ async def unsubscribe_session_events(
 
 
 @mcp.tool()
-async def plugin_add(
+async def add_plugin(
     name: str,
     command: str,
     session_id: str,
@@ -1065,12 +1065,12 @@ async def plugin_add(
     ``auto_start`` — if ``True``, the plugin is started automatically whenever
                      the broker boots.
 
-    The registration is persisted to the state file. Call ``plugin_start`` to
+    The registration is persisted to the state file. Call ``start_plugin`` to
     launch the process immediately.
     """
-    _tool_call_counts["plugin_add"] += 1
+    _tool_call_counts["add_plugin"] += 1
     if name in plugins:
-        return f"plugin '{name}' already registered; use plugin_remove first to replace"
+        return f"plugin '{name}' already registered; use remove_plugin first to replace"
     plugins[name] = PluginEntry(
         name=name, command=command, session_id=session_id,
         env=env or {}, auto_start=auto_start,
@@ -1081,9 +1081,9 @@ async def plugin_add(
 
 
 @mcp.tool()
-async def plugin_remove(name: str) -> str:
+async def remove_plugin(name: str) -> str:
     """Stop (if running) and remove a plugin from the registry."""
-    _tool_call_counts["plugin_remove"] += 1
+    _tool_call_counts["remove_plugin"] += 1
     entry = plugins.get(name)
     if entry is None:
         return f"plugin '{name}' not found"
@@ -1096,12 +1096,12 @@ async def plugin_remove(name: str) -> str:
 
 
 @mcp.tool()
-async def plugin_start(name: str) -> str:
+async def start_plugin(name: str) -> str:
     """Start a registered plugin by spawning its subprocess."""
-    _tool_call_counts["plugin_start"] += 1
+    _tool_call_counts["start_plugin"] += 1
     entry = plugins.get(name)
     if entry is None:
-        return f"plugin '{name}' not registered; call plugin_add first"
+        return f"plugin '{name}' not registered; call add_plugin first"
     if _plugin_is_running(entry):
         return f"plugin '{name}' is already running (pid {entry.pid})"
     ok = await _launch_plugin(entry)
@@ -1113,9 +1113,9 @@ async def plugin_start(name: str) -> str:
 
 
 @mcp.tool()
-async def plugin_stop(name: str) -> str:
+async def stop_plugin(name: str) -> str:
     """Send SIGTERM to a running plugin process."""
-    _tool_call_counts["plugin_stop"] += 1
+    _tool_call_counts["stop_plugin"] += 1
     entry = plugins.get(name)
     if entry is None:
         return f"plugin '{name}' not registered"
@@ -1128,9 +1128,9 @@ async def plugin_stop(name: str) -> str:
 
 
 @mcp.tool()
-async def plugin_restart(name: str) -> str:
+async def restart_plugin(name: str) -> str:
     """Stop and restart a plugin."""
-    _tool_call_counts["plugin_restart"] += 1
+    _tool_call_counts["restart_plugin"] += 1
     entry = plugins.get(name)
     if entry is None:
         return f"plugin '{name}' not registered"
@@ -1145,7 +1145,7 @@ async def plugin_restart(name: str) -> str:
 
 
 @mcp.tool()
-async def plugin_list() -> list[dict[str, Any]]:
+async def list_plugins() -> list[dict[str, Any]]:
     """List all registered plugins with their current status.
 
     Each entry includes:
@@ -1157,7 +1157,7 @@ async def plugin_list() -> list[dict[str, Any]]:
     - ``running`` — ``True`` if the process is currently alive.
     - ``connected`` — ``True`` if the plugin's session is registered on the broker.
     """
-    _tool_call_counts["plugin_list"] += 1
+    _tool_call_counts["list_plugins"] += 1
     async with registry_lock:
         registered_sessions = set(sessions.keys())
     return [

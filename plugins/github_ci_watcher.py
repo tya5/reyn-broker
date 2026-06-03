@@ -13,13 +13,13 @@ Usage
 -----
 Register and start via broker MCP::
 
-    plugin_add(
+    add_plugin(
         name="ci-watcher",
         command="/path/to/.venv/bin/reyn-broker-ci",
         session_id="ci-watcher",
         auto_start=True,
     )
-    plugin_start("ci-watcher")
+    start_plugin("ci-watcher")
 
 Or run directly::
 
