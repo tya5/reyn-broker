@@ -401,18 +401,15 @@ class BrokerPlugin:
                     ClientSession(read, write) as cs,
                 ):
                     await cs.initialize()
-                    await cs.call_tool("register_session", {
+                    schema = self.commands()
+                    reg_args: dict[str, Any] = {
                         "session_id": self.session_id,
                         "working_dir": os.getcwd(),
                         "role": self.role,
-                    })
-                    # Register command schema with broker for discoverability
-                    schema = self.commands()
+                    }
                     if schema:
-                        await cs.call_tool("register_plugin_commands", {
-                            "session_id": self.session_id,
-                            "commands": schema,
-                        })
+                        reg_args["commands"] = schema
+                    await cs.call_tool("register_session", reg_args)
                     logger.info(
                         "[%s] registered on broker (%d commands)", self.session_id, len(schema)
                     )

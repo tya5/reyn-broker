@@ -102,7 +102,6 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `add_plugin`        | `name`, `command`, `session_id`, `env?`, `auto_start?` | Register and optionally auto-start a plugin subprocess.                   |
 | `start_plugin` / `stop_plugin` / `restart_plugin` / `remove_plugin` | `name` | Manage plugin lifecycle without broker restart. |
 | `list_plugins`       | *(none)*                                        | List registered plugins with running state and PID.                             |
-| `register_plugin_commands` | `session_id`, `commands`               | Register a plugin's command schema for discoverability via `list_plugin_commands`. |
 | `list_plugin_commands` | `session_id`                                  | Retrieve a plugin's declared command schema.                                    |
 | `health_check`      | *(none)*                                        | Returns `version`, `started_at_iso`, `uptime_seconds`, `session_count`, `total_pending`. |
 

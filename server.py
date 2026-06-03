@@ -394,6 +394,7 @@ def _register_locked(
     mcp_session: Any,
     role: str | None,
     ttl_hours: float | None,
+    commands: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Register a session and drain its inbox.  Caller MUST hold ``registry_lock``."""
     session_expires_at: float | None = None
@@ -406,6 +407,8 @@ def _register_locked(
         role=role,
         session_expires_at=session_expires_at,
     )
+    if commands is not None:
+        plugin_commands[session_id] = commands
     backlog = _drain_inbox_locked(session_id)
     _push_session_event_locked("registered", session_id)
     return f"registered '{session_id}' at {working_dir}", backlog
@@ -440,6 +443,7 @@ async def register_session(
     ctx: Context,
     role: str | None = None,
     ttl_hours: float | None = None,
+    commands: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Register this Claude Code session with the broker.
 
@@ -454,13 +458,20 @@ async def register_session(
     for short-lived task sessions that may not call ``unregister_session``
     before exiting. Omit for permanent sessions.
 
+    ``commands`` — optional list of command dicts (each with ``name``,
+    ``description``, ``args``) to register alongside the session.  Plugins
+    pass their command schema here so peers can discover it via
+    ``list_plugin_commands`` without a separate round-trip.
+
     Returns any messages that were queued while this session was offline.
     Prefer ``startup_summary`` at startup to combine this call with
     ``list_sessions`` in one round-trip.
     """
     _tool_call_counts["register_session"] += 1
     async with registry_lock:
-        status, backlog = _register_locked(session_id, working_dir, ctx.session, role, ttl_hours)
+        status, backlog = _register_locked(
+            session_id, working_dir, ctx.session, role, ttl_hours, commands
+        )
         _save_state()
 
     return {"status": status, "pending_messages": backlog}
@@ -474,6 +485,7 @@ async def startup_summary(
     role: str | None = None,
     compact: bool = True,
     ttl_hours: float | None = None,
+    commands: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Register this session and return the peer list in a single round-trip.
 
@@ -495,7 +507,9 @@ async def startup_summary(
     """
     _tool_call_counts["startup_summary"] += 1
     async with registry_lock:
-        status, backlog = _register_locked(session_id, working_dir, ctx.session, role, ttl_hours)
+        status, backlog = _register_locked(
+            session_id, working_dir, ctx.session, role, ttl_hours, commands
+        )
         session_list = _session_list_locked(compact)
         _save_state()
 
@@ -897,24 +911,6 @@ async def set_monitor_session(session_id: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Plugin command registry tools
 # ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def register_plugin_commands(
-    session_id: str,
-    commands: list[dict[str, Any]],
-) -> str:
-    """Register a plugin's command schema with the broker.
-
-    Called automatically by :class:`BrokerPlugin` on startup — plugin
-    authors do not need to call this directly.
-
-    ``commands`` is a list of dicts with keys ``name``, ``description``,
-    and ``args`` (list of positional argument names).
-    """
-    _tool_call_counts["register_plugin_commands"] += 1
-    plugin_commands[session_id] = commands
-    return f"registered {len(commands)} command(s) for '{session_id}'"
 
 
 @mcp.tool()
