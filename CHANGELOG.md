@@ -2,6 +2,16 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.15.2] - 2026-06-04
+
+### Fixed
+- **Ghost subscriptions / command schemas after a session is gone.**
+  `unregister_session` (and TTL expiry) removed the `SessionEntry` but left the
+  session's `event_subscriptions` and `plugin_commands` entries behind. The
+  stale subscription kept matching events, and `list_plugin_commands` still
+  returned commands for a session that no longer existed. Both are now dropped
+  via `_forget_session_locked` when the session is removed.
+
 ## [0.15.1] - 2026-06-04
 
 ### Fixed

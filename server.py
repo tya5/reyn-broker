@@ -29,7 +29,7 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.15.1"
+_VERSION = "0.15.2"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.
@@ -109,6 +109,7 @@ async def _background_purge() -> None:
             ]
             for sid in expired:
                 del sessions[sid]
+                _forget_session_locked(sid)
                 logger.info("session TTL expired, removed: %s", sid)
             if expired:
                 _save_state()
@@ -389,6 +390,18 @@ async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
         return False
 
 
+def _forget_session_locked(session_id: str) -> None:
+    """Drop a gone session's event subscriptions and command schema.
+
+    Caller MUST hold ``registry_lock``. Without this, unregistering (or TTL-
+    expiring) a session left its ``event_subscriptions`` / ``plugin_commands``
+    entries behind as ghosts — they kept matching events and surfacing in
+    ``list_plugin_commands`` for a session that no longer exists.
+    """
+    event_subscriptions.pop(session_id, None)
+    plugin_commands.pop(session_id, None)
+
+
 def _push_session_event_locked(
     event_type: str,
     session_id: str,
@@ -559,6 +572,7 @@ async def unregister_session(session_id: str) -> str:
     async with registry_lock:
         existed = sessions.pop(session_id, None)
         if existed is not None:
+            _forget_session_locked(session_id)
             _push_session_event_locked("unregistered", session_id)
             _save_state()
     if existed is None:

@@ -979,7 +979,7 @@ async def test_session_ttl_expires_and_removed(broker_url: str) -> None:
 async def test_health_check_returns_expected_fields(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.15.1"
+    assert result["version"] == "0.15.2"
     assert isinstance(result["uptime_seconds"], int)
     assert result["uptime_seconds"] >= 0
     assert result["started_at_iso"].startswith("20")
@@ -1295,7 +1295,7 @@ async def test_restart_plugin(broker_url: str) -> None:
 async def test_health_check_version_updated(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.15.1"
+    assert result["version"] == "0.15.2"
 
 
 # ---------------------------------------------------------------------------
@@ -1450,3 +1450,27 @@ async def test_set_active_noop_when_unchanged(broker_url: str) -> None:
         msgs = [m for m in _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
                 if m.get("event") == "active_changed"]
     assert msgs == []
+
+
+@pytest.mark.asyncio
+async def test_unregister_drops_subscriptions_and_commands(broker_url: str) -> None:
+    """unregister_session must not leave ghost subscriptions or command schema."""
+    async with _client(broker_url) as c:
+        await c.call_tool("register_session", {
+            "session_id": "ghost", "working_dir": "/tmp/g",
+            "commands": [{"name": "ping", "description": "p", "args": []}],
+        })
+        await c.call_tool("subscribe_session_events", {
+            "subscriber_id": "ghost", "event_types": ["posted"],
+        })
+        before = _payload(await c.call_tool("list_plugin_commands", {"session_id": "ghost"}))
+        assert before == [{"name": "ping", "description": "p", "args": []}]
+
+        await c.call_tool("unregister_session", {"session_id": "ghost"})
+
+        # command schema gone
+        assert _payload(await c.call_tool("list_plugin_commands", {"session_id": "ghost"})) == []
+        # subscription gone: a posted event is NOT queued to the gone ghost
+        await c.call_tool("register_session", {"session_id": "mover", "working_dir": "/tmp/m"})
+        await c.call_tool("post_message", {"to": "x", "from_session": "mover", "message": "hi"})
+        assert _payload(await c.call_tool("receive_messages", {"session_id": "ghost"})) == []
