@@ -13,10 +13,11 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import time
 from collections import defaultdict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.12.0"
+_VERSION = "0.13.0"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.
@@ -49,9 +50,22 @@ class SessionEntry:
     session_expires_at: float | None = None  # epoch timestamp; None = no TTL
 
 
+@dataclass
+class PluginEntry:
+    name: str
+    command: str                              # shell command to launch the plugin
+    session_id: str                           # broker session_id the plugin registers as
+    env: dict[str, str] = field(default_factory=dict)  # extra env vars (merged with os.environ)
+    auto_start: bool = False                  # start automatically when broker boots
+    pid: int | None = None                    # last known PID (None = never started)
+
+
 sessions: dict[str, SessionEntry] = {}
 pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
+plugins: dict[str, PluginEntry] = {}
 registry_lock = asyncio.Lock()
+# Live asyncio subprocess handles (not persisted — lost on broker restart)
+_plugin_procs: dict[str, Any] = {}
 
 _DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "reyn-broker" / "state.json"
 _STATE_PATH = Path(os.environ.get("BROKER_STATE_FILE", _DEFAULT_STATE_PATH))
@@ -80,14 +94,67 @@ async def _background_purge() -> None:
                 _save_state()
 
 
+def _plugin_is_running(entry: PluginEntry) -> bool:
+    """Return True if the plugin process is alive."""
+    proc = _plugin_procs.get(entry.name)
+    if proc is not None and proc.returncode is None:
+        return True
+    if entry.pid is not None:
+        with suppress(OSError):
+            os.kill(entry.pid, 0)
+            return True
+    return False
+
+
+async def _launch_plugin(entry: PluginEntry) -> bool:
+    """Spawn a plugin subprocess. Returns True on success."""
+    env = {**os.environ, **entry.env}
+    args = shlex.split(entry.command)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        _plugin_procs[entry.name] = proc
+        entry.pid = proc.pid
+        logger.info("plugin '%s' started (pid %d)", entry.name, proc.pid)
+        return True
+    except Exception as exc:
+        logger.warning("failed to start plugin '%s': %s", entry.name, exc)
+        return False
+
+
+async def _terminate_plugin(entry: PluginEntry) -> None:
+    """Send SIGTERM to a plugin process and wait briefly."""
+    proc = _plugin_procs.pop(entry.name, None)
+    if proc is not None and proc.returncode is None:
+        with suppress(ProcessLookupError):
+            proc.terminate()
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+    elif entry.pid is not None:
+        with suppress(ProcessLookupError, OSError):
+            os.kill(entry.pid, 15)  # SIGTERM
+    entry.pid = None
+
+
 @asynccontextmanager
 async def _lifespan(app: Any):
-    task = asyncio.create_task(_background_purge())
+    purge_task = asyncio.create_task(_background_purge())
+    # Auto-start plugins registered before broker boot
+    for entry in list(plugins.values()):
+        if entry.auto_start and not _plugin_is_running(entry):
+            await _launch_plugin(entry)
     try:
         yield
     finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        purge_task.cancel()
+        for entry in list(plugins.values()):
+            if _plugin_is_running(entry):
+                await _terminate_plugin(entry)
+        await asyncio.gather(purge_task, return_exceptions=True)
 
 
 mcp = FastMCP("broker", lifespan=_lifespan)
@@ -116,6 +183,17 @@ def _save_state() -> None:
                 for e in sessions.values()
             ],
             "pending": {k: v for k, v in pending.items() if v},
+            "plugins": [
+                {
+                    "name": p.name,
+                    "command": p.command,
+                    "session_id": p.session_id,
+                    "env": p.env,
+                    "auto_start": p.auto_start,
+                    "pid": p.pid,
+                }
+                for p in plugins.values()
+            ],
         }
         tmp = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False))
@@ -146,11 +224,21 @@ def _load_state() -> None:
         )
     for sid, msgs in data.get("pending", {}).items():
         pending[sid].extend(msgs)
+    for p in data.get("plugins", []):
+        plugins[p["name"]] = PluginEntry(
+            name=p["name"],
+            command=p["command"],
+            session_id=p["session_id"],
+            env=p.get("env", {}),
+            auto_start=p.get("auto_start", False),
+            pid=p.get("pid"),
+        )
     logger.info(
-        "restored state: %d sessions, %d queued messages across %d inboxes",
+        "restored state: %d sessions, %d queued messages across %d inboxes, %d plugins",
         len(sessions),
         sum(len(v) for v in pending.values()),
         len(pending),
+        len(plugins),
     )
 
 
@@ -638,6 +726,141 @@ async def set_monitor_session(session_id: str | None = None) -> str:
     if _MONITOR_SID:
         return f"monitor enabled: all messages copied to '{_MONITOR_SID}'"
     return "monitor disabled"
+
+
+# ---------------------------------------------------------------------------
+# Plugin lifecycle tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def plugin_add(
+    name: str,
+    command: str,
+    session_id: str,
+    env: dict[str, str] | None = None,
+    auto_start: bool = False,
+) -> str:
+    """Register a plugin in the persistent plugin registry.
+
+    ``name``       — unique identifier for this plugin (e.g. ``"telegram"``).
+    ``command``    — shell command used to launch the plugin process (e.g.
+                     ``"/path/to/.venv/bin/reyn-broker-telegram"``).
+    ``session_id`` — the broker session id the plugin will register as.
+    ``env``        — optional dict of extra environment variables merged with
+                     the broker's own environment when the plugin is launched.
+                     Do NOT put secrets here if they are already in the
+                     broker's environment; pass them via the system env instead.
+    ``auto_start`` — if ``True``, the plugin is started automatically whenever
+                     the broker boots.
+
+    The registration is persisted to the state file. Call ``plugin_start`` to
+    launch the process immediately.
+    """
+    _tool_call_counts["plugin_add"] += 1
+    if name in plugins:
+        return f"plugin '{name}' already registered; use plugin_remove first to replace"
+    plugins[name] = PluginEntry(
+        name=name, command=command, session_id=session_id,
+        env=env or {}, auto_start=auto_start,
+    )
+    async with registry_lock:
+        _save_state()
+    return f"plugin '{name}' registered (auto_start={auto_start})"
+
+
+@mcp.tool()
+async def plugin_remove(name: str) -> str:
+    """Stop (if running) and remove a plugin from the registry."""
+    _tool_call_counts["plugin_remove"] += 1
+    entry = plugins.get(name)
+    if entry is None:
+        return f"plugin '{name}' not found"
+    if _plugin_is_running(entry):
+        await _terminate_plugin(entry)
+    del plugins[name]
+    async with registry_lock:
+        _save_state()
+    return f"plugin '{name}' removed"
+
+
+@mcp.tool()
+async def plugin_start(name: str) -> str:
+    """Start a registered plugin by spawning its subprocess."""
+    _tool_call_counts["plugin_start"] += 1
+    entry = plugins.get(name)
+    if entry is None:
+        return f"plugin '{name}' not registered; call plugin_add first"
+    if _plugin_is_running(entry):
+        return f"plugin '{name}' is already running (pid {entry.pid})"
+    ok = await _launch_plugin(entry)
+    async with registry_lock:
+        _save_state()
+    if ok:
+        return f"plugin '{name}' started (pid {entry.pid})"
+    return f"plugin '{name}' failed to start"
+
+
+@mcp.tool()
+async def plugin_stop(name: str) -> str:
+    """Send SIGTERM to a running plugin process."""
+    _tool_call_counts["plugin_stop"] += 1
+    entry = plugins.get(name)
+    if entry is None:
+        return f"plugin '{name}' not registered"
+    if not _plugin_is_running(entry):
+        return f"plugin '{name}' is not running"
+    await _terminate_plugin(entry)
+    async with registry_lock:
+        _save_state()
+    return f"plugin '{name}' stopped"
+
+
+@mcp.tool()
+async def plugin_restart(name: str) -> str:
+    """Stop and restart a plugin."""
+    _tool_call_counts["plugin_restart"] += 1
+    entry = plugins.get(name)
+    if entry is None:
+        return f"plugin '{name}' not registered"
+    if _plugin_is_running(entry):
+        await _terminate_plugin(entry)
+    ok = await _launch_plugin(entry)
+    async with registry_lock:
+        _save_state()
+    if ok:
+        return f"plugin '{name}' restarted (pid {entry.pid})"
+    return f"plugin '{name}' failed to restart"
+
+
+@mcp.tool()
+async def plugin_list() -> list[dict[str, Any]]:
+    """List all registered plugins with their current status.
+
+    Each entry includes:
+    - ``name`` — plugin identifier.
+    - ``command`` — launch command.
+    - ``session_id`` — expected broker session id.
+    - ``auto_start`` — whether the plugin starts on broker boot.
+    - ``pid`` — last known process id (``None`` if never started).
+    - ``running`` — ``True`` if the process is currently alive.
+    - ``connected`` — ``True`` if the plugin's session is registered on the broker.
+    """
+    _tool_call_counts["plugin_list"] += 1
+    async with registry_lock:
+        registered_sessions = set(sessions.keys())
+    return [
+        {
+            "name": e.name,
+            "command": e.command,
+            "session_id": e.session_id,
+            "auto_start": e.auto_start,
+            "pid": e.pid,
+            "running": _plugin_is_running(e),
+            "connected": e.session_id in registered_sessions,
+        }
+        for e in plugins.values()
+    ]
 
 
 def main() -> None:

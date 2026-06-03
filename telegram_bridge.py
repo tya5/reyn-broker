@@ -454,8 +454,13 @@ async def main() -> None:
             await asyncio.sleep(_RECONNECT_S)
 
 
-if __name__ == "__main__":
+def _entrypoint() -> None:
+    """Entry point for ``reyn-broker-telegram`` CLI and plugin system."""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("[telegram-bridge] stopped")
+
+
+if __name__ == "__main__":
+    _entrypoint()
