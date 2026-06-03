@@ -270,42 +270,27 @@ subscribe_session_events(
 | `unregistered` | `unregister_session` が呼ばれた / TTL 期限切れ |
 | `posted` | `post_message` / `broadcast_message` が呼ばれた |
 
-### peer stall watcher での活用例
+### peer idle notifier での活用例
+
+セッションが `update_session_status(..., status="idle")` を呼んだ瞬間に検知して通知します。ポーリング不要・タイマー不要。
 
 ```python
-class StallWatcherPlugin(BrokerPlugin):
-    session_id = "stall-watcher"
-    role = "peer stall detection"
-
-    EXCLUDE = {"broker", "telegram", "stall-watcher"}
-    STALL_SECONDS = 900
-
-    def __init__(self):
-        self._last_seen: dict[str, datetime] = {}
+class PeerIdleNotifier(BrokerPlugin):
+    session_id = "peer-idle-notifier"
+    role = "peer idle detection — fires immediately on status → idle"
 
     async def on_start(self, broker: BrokerClient) -> None:
-        # list_sessions polling の代わりにイベント購読
-        await broker._cs.call_tool("subscribe_session_events", {
-            "subscriber_id": self.session_id,
-            "event_types": ["posted"],
-        })
-        broker.start_poll(60)
+        await broker.subscribe_events(["status_changed"])
 
-    async def on_broker_message(self, msg, broker):
-        if msg.get("event") == "posted":
-            sid = msg.get("session_id", "")
-            if sid not in self.EXCLUDE:
-                self._last_seen[sid] = datetime.fromisoformat(msg["at"])
-
-    async def on_poll(self, broker: BrokerClient) -> None:
-        now = datetime.now(timezone.utc)
-        for sid, last in self._last_seen.items():
-            silent = (now - last).total_seconds()
-            if silent > self.STALL_SECONDS:
-                await broker.post(
-                    to="backlog-watcher",
-                    message=f"PEER_STALL: {sid} silent={int(silent//60)}min",
-                )
+    async def on_broker_message(self, msg, broker: BrokerClient) -> None:
+        if msg.get("event") != "status_changed":
+            return
+        sid = msg.get("session_id", "")
+        if msg.get("status") == "idle":
+            await broker.post(
+                to="backlog-watcher",
+                message=f"PEER_IDLE: {sid} is ready for new work",
+            )
 ```
 
 ---
@@ -424,11 +409,11 @@ post_message(to="github-ci", from_session="me", message="list")
 
 複数セッションが同じ PR を watch した場合、全員に通知が届きます。
 
-### `peer_stall_watcher.py` — Peer Stall 検出
+### `peer_stall_watcher.py` — Peer Idle 検出
 
-セッションの活動を `subscribe_session_events` でリアルタイム追跡し、一定時間沈黙しているセッションを検出して通知します。`list_sessions` ポーリング不要。
+セッションが `update_session_status(..., status="idle")` を呼んだ瞬間に即通知します。ポーリング・タイマー不要。`status_changed` の before != after 保証により重複通知なし。
 
-環境変数: `PEER_STALL_THRESHOLD_S`（デフォルト 900s）、`PEER_STALL_NOTIFY`（デフォルト `backlog-watcher`）、`PEER_STALL_WATCH`（監視対象セッション、カンマ区切り。未設定時は broker と self 以外を全監視）
+環境変数: `PEER_IDLE_NOTIFY`（デフォルト `backlog-watcher`）、`PEER_IDLE_WATCH`（監視対象セッション）、`PEER_IDLE_STATES`（デフォルト `idle`）
 
 ```python
 plugin_add(

@@ -28,11 +28,11 @@ All notable changes to reyn-broker are documented in this file.
 ### Changed
 - `list_sessions` compact shape now includes `"status"` field.
 - `list_sessions` full shape now includes `"status"` and `"status_detail"`.
-- `peer_stall_watcher`: rewritten to subscribe to `status_changed` /
-  `registered` / `unregistered` events — zero `list_sessions` polling.
-  Stall is detected when a session stays in a monitored state (default:
-  `idle` or `waiting`) beyond the threshold.
-  `PEER_STALL_EXCLUDE` replaced by `PEER_STALL_WATCH` (opt-in include list).
+- `peer_stall_watcher`: rewritten as an immediate idle notifier. Subscribes
+  to `status_changed` and fires instantly when a session transitions to an
+  idle state — no timer, no threshold, no local state cache. Duplicate
+  notifications are prevented by the server-side `before != after` guarantee
+  on `update_session_status`. Env vars renamed to `PEER_IDLE_*`.
 - `plugins/github_pr_watcher`: manual `on_broker_message` dispatch replaced
   with `@command` + `sender` parameter.
 
