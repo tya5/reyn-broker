@@ -80,6 +80,7 @@ _plugin_procs: dict[str, Any] = {}
 
 _DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "reyn-broker" / "state.json"
 _STATE_PATH = Path(os.environ.get("BROKER_STATE_FILE", _DEFAULT_STATE_PATH))
+_PLUGIN_LOG_DIR = _STATE_PATH.parent / "plugins"
 
 
 async def _background_purge() -> None:
@@ -122,15 +123,18 @@ async def _launch_plugin(entry: PluginEntry) -> bool:
     env = {**os.environ, **entry.env}
     args = shlex.split(entry.command)
     try:
+        _PLUGIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = _PLUGIN_LOG_DIR / f"{entry.name}.log"
+        log_fh = log_path.open("a")
         proc = await asyncio.create_subprocess_exec(
             *args,
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=log_fh,
         )
         _plugin_procs[entry.name] = proc
         entry.pid = proc.pid
-        logger.info("plugin '%s' started (pid %d)", entry.name, proc.pid)
+        logger.info("plugin '%s' started (pid %d, log %s)", entry.name, proc.pid, log_path)
         return True
     except Exception as exc:
         logger.warning("failed to start plugin '%s': %s", entry.name, exc)
@@ -138,17 +142,41 @@ async def _launch_plugin(entry: PluginEntry) -> bool:
 
 
 async def _terminate_plugin(entry: PluginEntry) -> None:
-    """Send SIGTERM to a plugin process and wait briefly."""
+    """Send SIGTERM then SIGKILL to a plugin process."""
     proc = _plugin_procs.pop(entry.name, None)
     if proc is not None and proc.returncode is None:
         with suppress(ProcessLookupError):
             proc.terminate()
-        with suppress(asyncio.TimeoutError):
+        try:
             await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("plugin '%s' did not exit after SIGTERM, sending SIGKILL", entry.name)
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=2)
     elif entry.pid is not None:
         with suppress(ProcessLookupError, OSError):
             os.kill(entry.pid, 15)  # SIGTERM
     entry.pid = None
+
+
+async def _plugin_supervisor() -> None:
+    """Restart auto_start plugins that have crashed (checked every 10 s)."""
+    while True:
+        await asyncio.sleep(10)
+        for entry in list(plugins.values()):
+            if not entry.auto_start:
+                continue
+            if _plugin_is_running(entry):
+                continue
+            proc = _plugin_procs.get(entry.name)
+            if proc is not None and proc.returncode is not None:
+                logger.warning(
+                    "plugin '%s' exited (rc %d), restarting", entry.name, proc.returncode
+                )
+                _plugin_procs.pop(entry.name, None)
+                await _launch_plugin(entry)
 
 
 @asynccontextmanager
@@ -158,14 +186,16 @@ async def _lifespan(app: Any):
     for entry in list(plugins.values()):
         if entry.auto_start and not _plugin_is_running(entry):
             await _launch_plugin(entry)
+    supervisor_task = asyncio.create_task(_plugin_supervisor())
     try:
         yield
     finally:
+        supervisor_task.cancel()
         purge_task.cancel()
         for entry in list(plugins.values()):
             if _plugin_is_running(entry):
                 await _terminate_plugin(entry)
-        await asyncio.gather(purge_task, return_exceptions=True)
+        await asyncio.gather(supervisor_task, purge_task, return_exceptions=True)
 
 
 mcp = FastMCP("broker", lifespan=_lifespan)
