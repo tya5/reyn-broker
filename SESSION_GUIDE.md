@@ -229,26 +229,42 @@ session 自身だけ**。だから status の自己申告は「便利」では�
 
 ### active は両エッジを撃つ義務（hook）
 
-`active_changed` は**フリップ時のみ**発火する。両エッジを hook で撃つ:
+`active_changed` は**フリップ時のみ**発火する。両エッジを hook で撃つ。
+**推奨は `PreToolUse` + `Stop` の2つ**:
 
 | エッジ | hook | コマンド |
 |---|---|---|
-| 作業開始 | UserPromptSubmit / PreToolUse | `reyn-broker-active <id> true` |
-| 作業終了 | Stop | `reyn-broker-active <id> false` |
+| 作業中 | **PreToolUse** | `reyn-broker-active <id> true` |
+| 作業終了 | **Stop** | `reyn-broker-active <id> false` |
+
+**なぜ作業開始に `UserPromptSubmit` でなく `PreToolUse` か**:
+broker の task-notification / wakeup 経由の再開は `UserPromptSubmit` を**通らない**。
+そのため UserPromptSubmit で true を撃つ設計だと、wakeup で再開した session が
+idle のまま取り残される（= 一番 dormancy しやすい session を捕り逃す）。
+`PreToolUse` なら「作業すれば必ず何かツールを使う」ので、**user-prompt 起点でも
+wakeup 起点でも確実に true になる**。1つの hook で両経路をカバーできる。
+
+**毎ツール呼ばれても安全**: `set_active` は値が変わらなければ no-op（`active_changed`
+を発火しない）。PreToolUse が毎回 true を撃っても、active→true のフリップ1回だけが
+イベント化され、購読側に spam は飛ばない（CLI 起動コストのみ）。
 
 **⚠️ active=true を撃たないと sticky-idle トラップ**: 一度 false にしたきり再開時に
 true へ戻さないと、watcher は「idle のまま」と「再開した」を区別できず永遠に idle に見える。
 
-**⚠️ 再開経路の落とし穴**: broker の task-notification / wakeup 経由の再開は
-`UserPromptSubmit` hook を通らないことがある。active=true は
-**user-prompt 起点と notification/wakeup 起点の両方**でカバーすること
-（dormancy 体質の session ほどここで idle 解除し損ねやすい）。
-
-```bash
-# settings.json — 作業開始エッジ（UserPromptSubmit + wakeup 経路の両方）
-reyn-broker-active <session_id> true
-# Stop hook — 作業終了エッジ
-reyn-broker-active <session_id> false
+```jsonc
+// settings.json
+{
+  "hooks": {
+    "PreToolUse": [{ "matcher": "", "hooks": [{
+      "type": "command",
+      "command": "/path/to/.venv/bin/reyn-broker-active <session_id> true"
+    }]}],
+    "Stop": [{ "matcher": "", "hooks": [{
+      "type": "command",
+      "command": "/path/to/.venv/bin/reyn-broker-active <session_id> false"
+    }]}]
+  }
+}
 ```
 
 ### status は任意の enrichment（LLM）

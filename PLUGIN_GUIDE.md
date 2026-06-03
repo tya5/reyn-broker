@@ -277,10 +277,13 @@ await broker.subscribe_events(
 | **status**（意味的 str） | `status_changed` | LLM | enrichment（「なぜ idle か」）。authority ではない |
 
 **前提となる session 側の責務**（SESSION_GUIDE §4.5）:
-- 各 session は **active の両エッジ**を hook で撃つ — 作業開始 → `reyn-broker-active <id> true`、
-  停止 → `reyn-broker-active <id> false`（いずれも LLM turn 不要の one-shot CLI）。
-- active-edge は user-prompt 起点と **wakeup 起点の両方**でカバーする
-  （さもないと dormancy 体質の session が再開時に解除し損ねる）。
+- 各 session は **active の両エッジ**を hook で撃つ（LLM turn 不要の one-shot CLI）:
+  - **PreToolUse** → `reyn-broker-active <id> true`（作業中。user-prompt 起点でも
+    wakeup 起点でも、ツールを使えば必ず true になる = 両経路を1つでカバー）
+  - **Stop** → `reyn-broker-active <id> false`（作業終了）
+- `UserPromptSubmit` ではなく `PreToolUse` を使うのは、wakeup 経由の再開が
+  UserPromptSubmit を通らず idle に取り残されるため。`set_active` の no-op guard で
+  毎ツール呼んでも spam は出ない。
 
 この責務が満たされて初めて、下記の idle notifier が「なぜ `active_changed` 購読
 だけで閉じるか」が成立する。`active_changed` はフリップ時のみ発火するので、watcher
