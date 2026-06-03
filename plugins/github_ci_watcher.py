@@ -1,7 +1,13 @@
-"""GitHub CI watcher plugin for reyn-broker.
+"""GitHub Actions CI status watcher plugin for reyn-broker.
 
-Polls GitHub PR check status via ``gh`` CLI and relays state changes
-as broker messages to requesting sessions.
+Monitors GitHub Pull Request check results (GitHub Actions, required status
+checks, etc.) via the ``gh`` CLI and relays status changes as broker messages
+to requesting sessions.
+
+Useful for letting Claude Code sessions know when a CI run finishes without
+the session having to poll GitHub itself. When a PR's checks change from
+"pending" to "success" or "failure", all sessions that registered a watch
+are notified immediately (within the poll interval).
 
 Usage
 -----

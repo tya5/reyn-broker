@@ -34,7 +34,7 @@ dev = [
 [project.scripts]
 reyn-broker = "server:main"
 reyn-broker-telegram = "telegram_bridge:_entrypoint"
-reyn-broker-ci = "plugins.ci_watcher:main"
+reyn-broker-github-ci = "plugins.github_ci_watcher:main"
 
 [project.urls]
 Homepage = "https://github.com/tya5/reyn-broker"

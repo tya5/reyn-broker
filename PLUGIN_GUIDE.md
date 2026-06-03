@@ -241,35 +241,41 @@ plugin_add(
 
 詳細は `telegram_bridge.py` のドキュメントを参照してください。
 
-### `plugins/ci_watcher.py` — GitHub CI ウォッチャー
+### `plugins/github_ci_watcher.py` — GitHub Actions CI ウォッチャー
 
-`gh` CLI 経由で GitHub PR のチェック状態を監視し、変化があった場合に broker メッセージとして通知します。
+GitHub Pull Request のチェック結果（GitHub Actions・required status checks など）を
+`gh` CLI 経由で監視し、ステータスが変化したときに broker メッセージとして通知します。
+
+Claude Code セッションが自分で GitHub をポーリングしなくても、
+CI の完了を broker 経由で受け取れるようになります。
 
 必要条件:
-- `gh` CLI がインストールされ認証済みであること
+- `gh` CLI がインストールされ認証済みであること (`gh auth login`)
 
 登録例:
 ```python
 plugin_add(
-    name="ci-watcher",
-    command="/path/to/.venv/bin/reyn-broker-ci",
-    session_id="ci-watcher",
+    name="github-ci",
+    command="/path/to/.venv/bin/reyn-broker-github-ci",
+    session_id="github-ci",
     auto_start=True,
 )
 ```
 
-使用方法（PR の監視開始）:
+使用方法:
 ```python
-post_message(
-    to="ci-watcher",
-    from_session="my-session",
-    message="watch:#1268",
-)
-# 状態変化時に "✅ CI #1268: SUCCESS" がmy-session に届く
+# PR #1268 の監視を開始（自分のセッションに結果が届く）
+post_message(to="github-ci", from_session="my-session", message="watch:#1268")
+# → "✅ CI #1268: SUCCESS" または "❌ CI #1268: FAILURE" が届く
 
-post_message(to="ci-watcher", from_session="my-session", message="unwatch:#1268")
-post_message(to="ci-watcher", from_session="my-session", message="list")
+# 監視停止
+post_message(to="github-ci", from_session="my-session", message="unwatch:#1268")
+
+# 監視中の PR 一覧
+post_message(to="github-ci", from_session="my-session", message="list")
 ```
+
+複数のセッションが同じ PR を watch した場合、全員に通知が届きます。
 
 ---
 
