@@ -10,27 +10,30 @@ Telegram ブリッジや GitHub CI ウォッチャーのように、**外部サ�
 
 1. [アーキテクチャ](#アーキテクチャ)
 2. [最小プラグインの実装](#最小プラグインの実装)
-3. [BrokerPlugin リファレンス](#brokerplugin-リファレンス)
-4. [プラグインのパッケージング](#プラグインのパッケージング)
-5. [broker へのプラグイン登録・起動](#broker-へのプラグイン登録起動)
-6. [バンドルプラグイン](#バンドルプラグイン)
-7. [設計原則](#設計原則)
+3. [コマンドの宣言（@command）](#コマンドの宣言command)
+4. [BrokerClient リファレンス](#brokerclient-リファレンス)
+5. [BrokerPlugin リファレンス](#brokerplugin-リファレンス)
+6. [セッションイベント購読](#セッションイベント購読)
+7. [プラグインのパッケージング](#プラグインのパッケージング)
+8. [broker へのプラグイン登録・起動](#broker-へのプラグイン登録起動)
+9. [バンドルプラグイン](#バンドルプラグイン)
+10. [設計原則](#設計原則)
 
 ---
 
 ## アーキテクチャ
 
 ```
-reyn-broker (core)        ← domain-agnostic メッセージルーター
+reyn-broker (core)              ← domain-agnostic メッセージルーター
       ↕ MCP
- BrokerPlugin (base)      ← 接続・登録・inbox drain・再接続を共通化
+ BrokerPlugin (plugin_base.py)  ← 接続・登録・inbox drain・再接続を共通化
       ↕ (継承)
- plugins/telegram.py      ← Telegram ↔ broker ゲートウェイ
- plugins/ci_watcher.py    ← GitHub CI poll → broker リレー
- my_plugin/               ← あなたのプラグイン
+ plugins/telegram.py            ← Telegram ↔ broker ゲートウェイ
+ plugins/github_ci_watcher.py   ← GitHub Actions CI poll → broker リレー
+ my_plugin.py                   ← あなたのプラグイン
 ```
 
-各プラグインは broker に **MCP セッションとして接続**します。プラグインは通常の Claude Code セッションと区別がなく、broker はプラグインが何をするかを知りません。
+各プラグインは broker に **MCP セッションとして接続**します。broker はプラグインが何をするかを知りません。
 
 ---
 
@@ -39,21 +42,16 @@ reyn-broker (core)        ← domain-agnostic メッセージルーター
 ```python
 # my_plugin.py
 import asyncio
-from mcp import ClientSession
-from plugin_base import BrokerPlugin
+from plugin_base import BrokerClient, BrokerPlugin, command
 
 
 class EchoPlugin(BrokerPlugin):
-    session_id = "echo"                        # broker 上のセッション ID
-    role = "echo back every message"           # list_sessions で表示される説明
+    session_id = "echo"           # broker 上のセッション ID
+    role = "echo back every message"
 
-    async def on_message(self, msg: dict, cs: ClientSession) -> None:
-        """受信メッセージを送信元に返す"""
-        await cs.call_tool("post_message", {
-            "to": msg["from"],
-            "from_session": self.session_id,
-            "message": f"echo: {msg['message']}",
-        })
+    @command(description="Echo a message back to the sender")
+    async def echo(self, text: str, broker: BrokerClient) -> str:
+        return f"echo: {text}"
 
 
 def main() -> None:
@@ -64,6 +62,12 @@ if __name__ == "__main__":
     main()
 ```
 
+他セッションからの呼び出し:
+```python
+post_message(to="echo", from_session="alice", message="echo:hello world")
+# → alice に "echo: hello world" が届く
+```
+
 実行:
 ```bash
 /path/to/broker/.venv/bin/python my_plugin.py
@@ -71,71 +75,194 @@ if __name__ == "__main__":
 
 ---
 
+## コマンドの宣言（@command）
+
+`@command` デコレータでメソッドをプラグインの公開コマンドとして宣言します。
+
+```python
+@command(description="短い説明文")
+async def command_name(self, arg1: str, arg2: str, broker: BrokerClient) -> str:
+    # 処理
+    return "返信テキスト（None または "" で返信抑制）"
+```
+
+### メッセージフォーマット
+
+呼び出し元は以下の形式でメッセージを送ります:
+
+```
+"command_name:arg1 arg2 ..."
+```
+
+`arg1`, `arg2` は位置引数として順番に渡されます。メソッドの引数より少ない場合は `""` で補完されます。
+
+```python
+# 引数1つ
+@command(description="Watch a PR")
+async def watch(self, pr_number: str, broker: BrokerClient) -> str: ...
+# → message="watch:#1268"
+
+# 引数なし
+@command(description="List watched PRs")
+async def list(self, broker: BrokerClient) -> str: ...
+# → message="list"  (引数なしコマンドは "command_name" のみでOK)
+
+# 引数2つ
+@command(description="Set threshold for a session")
+async def threshold(self, session_id: str, seconds: str, broker: BrokerClient) -> str: ...
+# → message="threshold:lead-coder 900"
+```
+
+### コマンドの発見
+
+他セッションはコマンド体系を問い合わせできます:
+
+```python
+get_plugin_commands("echo")
+# → [{"name": "echo", "description": "Echo a message back", "args": ["text"]}]
+```
+
+### on_broker_message へのフォールバック
+
+どのコマンドにもマッチしないメッセージは `on_broker_message` に渡されます。自由形式のメッセージや help レスポンスの実装に使います。
+
+---
+
+## BrokerClient リファレンス
+
+すべてのライフサイクルフックに `broker: BrokerClient` として渡されます。`from_session` は自動設定されます。
+
+### メッセージング
+
+```python
+await broker.post(to="lead-coder", message="done")
+await broker.broadcast(message="all hands")
+sessions = await broker.list_sessions(compact=True)
+msgs = await broker.peek(limit=5)
+```
+
+### ポーリング制御
+
+```python
+broker.start_poll(interval=60)  # on_poll を N秒毎に有効化（間隔変更も可）
+broker.stop_poll()               # on_poll を一時停止
+```
+
+---
+
 ## BrokerPlugin リファレンス
 
-### クラス属性（オーバーライド必須）
+### クラス属性（必須）
 
-| 属性 | 型 | 説明 |
-|---|---|---|
-| `session_id` | `str` | broker 上のセッション ID（他セッションがメッセージを送る宛先） |
-| `role` | `str` | `list_sessions` に表示される短い説明 |
+| 属性 | 説明 |
+|---|---|
+| `session_id` | broker 上のセッション ID |
+| `role` | `list_sessions` に表示される短い説明 |
 
-### クラス属性（オーバーライド任意）
+### クラス属性（任意）
 
 | 属性 | デフォルト | 説明 |
 |---|---|---|
-| `broker_url` | `http://127.0.0.1:8765/mcp` | 接続先 broker URL（`BROKER_URL` 環境変数で上書き可） |
-| `poll_seconds` | `30` | inbox drain 間隔（秒） |
+| `broker_url` | `http://127.0.0.1:8765/mcp` | `BROKER_URL` 環境変数で上書き可 |
+| `inbox_interval` | `30` | inbox drain 間隔（秒） |
+| `poll_interval` | `None` | 設定すると起動時から `on_poll` が有効になる |
 | `reconnect_seconds` | `10` | 接続失敗後の再接続待ち時間（秒） |
 
-### オーバーライドするメソッド
+### ライフサイクルフック
 
-#### `on_connected(cs: ClientSession) -> None`
-broker への接続・登録完了後に一度だけ呼ばれます。初期化処理（ウェルカムメッセージ送信、初期状態読み込み等）に使います。
+#### `on_start(broker: BrokerClient) -> None`
+broker への接続・登録完了後に一度だけ呼ばれます。
 
 ```python
-async def on_connected(self, cs: ClientSession) -> None:
-    await cs.call_tool("post_message", {
-        "to": "lead-coder",
-        "from_session": self.session_id,
-        "message": "MyPlugin started and ready.",
-    })
+async def on_start(self, broker: BrokerClient) -> None:
+    await broker.post(to="lead-coder", message="plugin started")
+    broker.start_poll(60)  # ポーリングを有効化
 ```
 
-#### `on_message(msg: dict, cs: ClientSession) -> None`
-inbox にメッセージが届くたびに呼ばれます。`msg` には最低限 `"from"` と `"message"` キーが含まれます。
+#### `on_broker_message(msg: dict, broker: BrokerClient) -> None`
+`@command` にマッチしないメッセージに対するフォールバック。`msg` は `{"from": "...", "message": "..."}` を含みます。
 
 ```python
-async def on_message(self, msg: dict, cs: ClientSession) -> None:
-    text = msg.get("message", "")
-    sender = msg.get("from", "?")
-    if text == "ping":
-        await cs.call_tool("post_message", {
-            "to": sender,
-            "from_session": self.session_id,
-            "message": "pong",
+async def on_broker_message(self, msg, broker):
+    await broker.post(to=msg["from"], message="unknown command")
+```
+
+#### `on_poll(broker: BrokerClient) -> None`
+ポーリングが有効な間、`poll_interval` 秒毎に呼ばれます。ループを書かないこと（基底クラスが繰り返し呼ぶ）。
+
+```python
+async def on_poll(self, broker: BrokerClient) -> None:
+    status = await asyncio.to_thread(check_external_api)
+    if status_changed(status):
+        await broker.broadcast(f"status: {status}")
+```
+
+---
+
+## セッションイベント購読
+
+broker の `subscribe_session_events` を使うと、セッションの活動変化を inbox 経由で受け取れます。`list_sessions` のポーリングが不要になります。
+
+```python
+# 購読（broker MCP ツールを直接呼ぶ）
+subscribe_session_events(
+    subscriber_id="my-plugin",
+    event_types=["registered", "unregistered", "posted"],
+    session_filter=None,  # None = 全セッション
+)
+```
+
+届くメッセージ形式:
+```json
+{"from": "broker", "event": "posted", "session_id": "lead-coder", "at": "2026-06-03T..."}
+```
+
+`session_filter` で監視対象を絞れます。除外したいセッション（broker/telegram 等）は subscriber 側でフィルタします。
+
+イベントタイプ:
+
+| イベント | トリガー |
+|---|---|
+| `registered` | `register_session` / `startup_summary` が呼ばれた |
+| `unregistered` | `unregister_session` が呼ばれた / TTL 期限切れ |
+| `posted` | `post_message` / `broadcast_message` が呼ばれた |
+
+### peer stall watcher での活用例
+
+```python
+class StallWatcherPlugin(BrokerPlugin):
+    session_id = "stall-watcher"
+    role = "peer stall detection"
+
+    EXCLUDE = {"broker", "telegram", "stall-watcher"}
+    STALL_SECONDS = 900
+
+    def __init__(self):
+        self._last_seen: dict[str, datetime] = {}
+
+    async def on_start(self, broker: BrokerClient) -> None:
+        # list_sessions polling の代わりにイベント購読
+        await broker._cs.call_tool("subscribe_session_events", {
+            "subscriber_id": self.session_id,
+            "event_types": ["posted"],
         })
-```
+        broker.start_poll(60)
 
-#### `run_tasks(cs: ClientSession) -> list[asyncio.Task]`
-inbox loop と並行して実行する追加タスクを返します。外部 API のポーリング、WebSocket 接続の維持などに使います。broker 接続が切れると全タスクがキャンセルされます。
+    async def on_broker_message(self, msg, broker):
+        if msg.get("event") == "posted":
+            sid = msg.get("session_id", "")
+            if sid not in self.EXCLUDE:
+                self._last_seen[sid] = datetime.fromisoformat(msg["at"])
 
-```python
-async def run_tasks(self, cs: ClientSession) -> list[asyncio.Task]:
-    return [
-        asyncio.create_task(self._poll_external_api(cs)),
-        asyncio.create_task(self._heartbeat_loop(cs)),
-    ]
-
-async def _poll_external_api(self, cs: ClientSession) -> None:
-    while True:
-        await asyncio.sleep(60)
-        data = await fetch_something()
-        if data_changed(data):
-            await cs.call_tool("broadcast_message", {
-                "from_session": self.session_id,
-                "message": f"Update: {data}",
-            })
+    async def on_poll(self, broker: BrokerClient) -> None:
+        now = datetime.now(timezone.utc)
+        for sid, last in self._last_seen.items():
+            silent = (now - last).total_seconds()
+            if silent > self.STALL_SECONDS:
+                await broker.post(
+                    to="backlog-watcher",
+                    message=f"PEER_STALL: {sid} silent={int(silent//60)}min",
+                )
 ```
 
 ---
@@ -153,7 +280,7 @@ if __name__ == "__main__":
 
 ### pyproject.toml に entry point を追加
 
-reyn-broker の `pyproject.toml` に追加する場合（バンドルプラグイン）:
+reyn-broker のバンドルプラグインとして追加する場合:
 
 ```toml
 [project.scripts]
@@ -171,65 +298,41 @@ my-plugin = "my_package.plugin:MyPlugin"
 
 ## broker へのプラグイン登録・起動
 
-プラグインを broker MCP 経由で管理できます（再起動不要）。
-
-### 登録
+broker MCP 経由でプラグインを動的に管理できます（再起動不要）。
 
 ```python
+# 登録
 plugin_add(
     name="my-plugin",
     command="/path/to/.venv/bin/python /path/to/my_plugin.py",
-    session_id="my-plugin",        # プラグインが register_session で使う session_id
-    env={"MY_API_KEY": "xxx"},     # 追加の環境変数（broker の env とマージ）
-    auto_start=True,               # broker 起動時に自動起動
+    session_id="my-plugin",
+    env={"MY_API_KEY": "xxx"},
+    auto_start=True,      # broker 起動時に自動起動
 )
-```
 
-### 起動・停止・再起動
+# 起動・停止・再起動・削除
+plugin_start("my-plugin")
+plugin_stop("my-plugin")
+plugin_restart("my-plugin")
+plugin_remove("my-plugin")
 
-```python
-plugin_start("my-plugin")      # サブプロセス起動
-plugin_stop("my-plugin")       # SIGTERM 送信
-plugin_restart("my-plugin")    # stop + start
-```
-
-### 状態確認
-
-```python
+# 状態確認
 plugin_list()
-# → [{
-#     "name": "my-plugin",
-#     "session_id": "my-plugin",
-#     "pid": 12345,
-#     "running": True,       # プロセスが生きているか
-#     "connected": True,     # broker session に登録済みか
-#     "auto_start": True,
-#   }, ...]
+# → [{"name": "my-plugin", "pid": 12345, "running": True, "connected": True, ...}]
 ```
 
-### 削除
-
-```python
-plugin_remove("my-plugin")    # 停止 + レジストリから削除
-```
-
-登録情報は broker の state ファイルに永続化されます。broker を再起動しても登録は維持されます。`auto_start=True` のプラグインは broker 起動時に自動で起動します。
+登録情報は state ファイルに永続化されます。`auto_start=True` のプラグインは broker 起動時に自動起動します。
 
 ---
 
 ## バンドルプラグイン
 
-reyn-broker には以下のプラグインが同梱されています。
-
 ### `plugins/telegram.py` — Telegram ブリッジ
 
 スマートフォンから broker セッションとやり取りするための双方向ゲートウェイ。
 
-必要な環境変数:
-- `TELEGRAM_BOT_TOKEN` — @BotFather から取得したトークン
-- `TELEGRAM_CHAT_ID` — あなたの Telegram ユーザー ID
+必要な環境変数: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 
-登録例:
 ```python
 plugin_add(
     name="telegram",
@@ -239,20 +342,12 @@ plugin_add(
 )
 ```
 
-詳細は `telegram_bridge.py` のドキュメントを参照してください。
-
 ### `plugins/github_ci_watcher.py` — GitHub Actions CI ウォッチャー
 
-GitHub Pull Request のチェック結果（GitHub Actions・required status checks など）を
-`gh` CLI 経由で監視し、ステータスが変化したときに broker メッセージとして通知します。
+GitHub PR のチェック結果（GitHub Actions）を監視し、状態変化を broker メッセージとして通知します。
 
-Claude Code セッションが自分で GitHub をポーリングしなくても、
-CI の完了を broker 経由で受け取れるようになります。
+必要条件: `gh` CLI がインストールされ認証済み (`gh auth login`)
 
-必要条件:
-- `gh` CLI がインストールされ認証済みであること (`gh auth login`)
-
-登録例:
 ```python
 plugin_add(
     name="github-ci",
@@ -262,27 +357,22 @@ plugin_add(
 )
 ```
 
-使用方法:
+コマンド:
 ```python
-# PR #1268 の監視を開始（自分のセッションに結果が届く）
-post_message(to="github-ci", from_session="my-session", message="watch:#1268")
-# → "✅ CI #1268: SUCCESS" または "❌ CI #1268: FAILURE" が届く
-
-# 監視停止
-post_message(to="github-ci", from_session="my-session", message="unwatch:#1268")
-
-# 監視中の PR 一覧
-post_message(to="github-ci", from_session="my-session", message="list")
+post_message(to="github-ci", from_session="me", message="watch:#1268")
+# → "✅ CI #1268: SUCCESS" が届く
+post_message(to="github-ci", from_session="me", message="unwatch:#1268")
+post_message(to="github-ci", from_session="me", message="list")
 ```
 
-複数のセッションが同じ PR を watch した場合、全員に通知が届きます。
+複数セッションが同じ PR を watch した場合、全員に通知が届きます。
 
 ---
 
 ## 設計原則
 
-1. **broker はドメインを知らない** — `waiting_for: ci:#1268` の意味を broker は解釈しない。broker は保存・配信するだけ。
-2. **プラグインは独立プロセス** — broker と別プロセスで動作し、MCP セッションとして接続。broker の再起動はプラグインに影響しない（自動再接続）。
-3. **トークンコスト 0 の処理は Python ループに** — LLM は confirmed な結果のみ受け取る。監視・ポーリング・判定は Python で完結させる。
-4. **`session_id` は一意に** — 同じ `session_id` のプラグインを複数起動すると inbox が競合する。1 session につき 1 プロセス。
-5. **broker_url を環境変数で上書き可能に** — `BROKER_URL` 環境変数を使えば、異なる broker インスタンスに接続できる。
+1. **broker はドメインを知らない** — コマンドの意味を broker は解釈しない。broker は保存・配信するだけ。
+2. **プラグインは独立プロセス** — broker と別プロセスで動作。broker の再起動はプラグインに影響しない（自動再接続）。
+3. **LLM コストゼロの処理は Python ループに** — 監視・ポーリング・判定は Python で完結。LLM は confirmed な結果のみ受け取る。
+4. **`session_id` は一意に** — 同じ `session_id` のプラグインを複数起動すると inbox が競合する。
+5. **`@command` でインターフェースを宣言する** — `on_broker_message` で手書きパーサーを書かない。発見可能性と保守性のために `@command` を使う。
