@@ -928,7 +928,7 @@ async def list_plugin_commands(session_id: str) -> list[dict[str, Any]]:
 
     Example::
 
-        list_plugin_commands("github-ci")
+        list_plugin_commands("ci-watcher")
         # → [
         #     {"name": "watch",   "args": ["pr_number"], "description": "Watch a PR"},
         #     {"name": "unwatch", "args": ["pr_number"], "description": "Stop watching"},
@@ -938,7 +938,7 @@ async def list_plugin_commands(session_id: str) -> list[dict[str, Any]]:
     To invoke a command, send a message in the format
     ``"<name>:<arg1> <arg2> ..."``:
 
-        post_message(to="github-ci", from_session="me", message="watch:#1268")
+        post_message(to="ci-watcher", from_session="me", message="watch:#1268")
     """
     _tool_call_counts["list_plugin_commands"] += 1
     return plugin_commands.get(session_id, [])
@@ -974,7 +974,10 @@ async def subscribe_session_events(
     - ``"unregistered"`` — a session called ``unregister_session`` or was
       removed by TTL expiry.
     - ``"posted"`` — a session called ``post_message`` or
-      ``broadcast_message`` (i.e. their ``last_post_at`` was updated).
+      ``broadcast_message``.
+    - ``"status_changed"`` — a session called ``update_session_status``
+      with a new value. The event payload carries extra ``status`` and
+      ``detail`` fields.
 
     ``session_filter`` — optional list of session ids to watch. ``None``
     (default) means watch all sessions.

@@ -15,7 +15,7 @@ Register and start via broker MCP::
 
     add_plugin(
         name="ci-watcher",
-        command="/path/to/.venv/bin/reyn-broker-ci",
+        command="/path/to/.venv/bin/reyn-broker-github-ci",
         session_id="ci-watcher",
         auto_start=True,
     )
@@ -23,7 +23,7 @@ Register and start via broker MCP::
 
 Or run directly::
 
-    /path/to/.venv/bin/python /path/to/broker/plugins/ci_watcher.py
+    /path/to/.venv/bin/python /path/to/broker/plugins/github_ci_watcher.py
 
 Broker protocol
 ---------------

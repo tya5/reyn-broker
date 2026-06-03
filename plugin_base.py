@@ -187,7 +187,8 @@ class BrokerClient:
         Parameters
         ----------
         event_types : list[str]
-            Any subset of ``["registered", "unregistered", "posted"]``.
+            Any subset of ``["registered", "unregistered", "posted",
+            "status_changed"]``.
         session_filter : list[str] | None
             Limit events to these session ids.  ``None`` = all sessions.
         """
