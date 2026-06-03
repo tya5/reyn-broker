@@ -32,8 +32,11 @@ the tail of a long message.
 Operational notes:
   - The watcher does NOT call register_session — that's the Claude Code
     session's job. The watcher only drains via receive_messages.
-  - Multiple concurrent watchers for the same session_id would race over
-    the inbox. Run at most one per session.
+  - At most one watcher per session_id is allowed. This is enforced with an
+    ``flock`` on a per-session lock file at startup: a second watcher for the
+    same session_id fails to acquire the lock and exits immediately (code 2).
+    Without this, concurrent watchers race over the inbox and a message
+    drained by the wrong one is silently lost to the intended consumer.
   - Transient broker outages back off ``ERROR_BACKOFF_S`` and stay quiet
     until 5 consecutive failures, then emit a single ``_watcher_error``
     line so the Claude Code session can see something is wrong.
@@ -52,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import re
@@ -71,6 +75,43 @@ JOURNAL_BASE = Path(os.environ.get("BROKER_INBOX_JOURNAL_DIR", "/tmp/reyn-broker
 MAX_INLINE_BODY = int(os.environ.get("BROKER_WATCHER_MAX_INLINE", "400"))
 
 _SAFE_SENDER_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _acquire_single_instance_lock(session_id: str):
+    """Take an exclusive per-session lock so only one watcher runs per session.
+
+    Two watchers polling the same ``session_id`` race over the inbox: whichever
+    calls ``receive_messages`` first drains the message and the other never sees
+    it. Because each watcher's stdout feeds a *different* Monitor task (or
+    /dev/null for a stray ``nohup`` process), a message drained by the wrong
+    watcher is silently lost from the intended consumer's perspective.
+
+    We make duplicate starts impossible: the second instance fails to acquire
+    the lock and exits immediately. The lock is an ``flock`` on a per-session
+    file; it releases automatically when the process exits (or the fd closes),
+    so a crashed watcher does not leave a stale lock behind.
+
+    Returns the held lock file object. The caller MUST keep a reference for the
+    process lifetime — letting it be garbage-collected would close the fd and
+    release the lock.
+    """
+    safe = _SAFE_SENDER_RE.sub("_", session_id)[:64] or "unknown"
+    JOURNAL_BASE.mkdir(parents=True, exist_ok=True)
+    lock_path = JOURNAL_BASE / f".watcher-{safe}.lock"
+    lock_fh = open(lock_path, "w")  # noqa: SIM115 — held for process lifetime, not a with-block
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fh.close()
+        sys.stderr.write(
+            f"[session_watcher] a watcher for session '{session_id}' is already "
+            f"running (lock: {lock_path}). Refusing to start a second instance — "
+            f"concurrent watchers race over the inbox and silently drop messages.\n"
+        )
+        sys.exit(2)
+    lock_fh.write(str(os.getpid()))
+    lock_fh.flush()
+    return lock_fh
 
 
 def _emit(payload: dict) -> None:
@@ -238,10 +279,14 @@ def main() -> int:
     )
     args = parser.parse_args()
     fields = [f.strip() for f in args.fields.split(",")] if args.fields else None
+    # Held for the process lifetime; prevents a second watcher for this session.
+    lock_fh = _acquire_single_instance_lock(args.session)
     try:
         asyncio.run(_poll_loop(args.session, fields))
     except KeyboardInterrupt:
         return 130
+    finally:
+        lock_fh.close()
     return 0
 
 
