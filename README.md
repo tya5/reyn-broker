@@ -10,7 +10,7 @@ by session id.
 ## What it is
 
 - A single long-running HTTP server that routes messages between independent
-  MCP clients. About 150 lines of Python on top of FastMCP.
+  MCP clients. Built on top of FastMCP with Streamable HTTP transport.
 - Each client connects, calls `register_session` with an id, and can `post_message`
   to any other registered id. Recipients pull via `register_session` (initial
   backlog) or `receive_messages` (polling).
@@ -80,6 +80,10 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
   session to re-initialize the MCP connection from scratch.
   **Prevention:** broker releases that change tool signatures are noted in CHANGELOG as
   requiring a session-side schema refresh.
+- **Upgrading to a version with renamed tools** (e.g. 0.13.x → 0.14.0 where
+  `plugin_add` became `add_plugin`) — `ToolSearch` partial refresh is not sufficient
+  because old tool names disappear entirely. **Restart all Claude Code sessions**
+  after upgrading to ensure clean schema state.
 
 ## MCP tools
 
