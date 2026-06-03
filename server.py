@@ -10,10 +10,12 @@ via the MCP-standard ``notifications/message`` (logging) notification.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import os
 import shlex
+import signal
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
@@ -27,7 +29,7 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.15.0"
+_VERSION = "0.15.1"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.
@@ -163,7 +165,7 @@ async def _terminate_plugin(entry: PluginEntry) -> None:
                 await asyncio.wait_for(proc.wait(), timeout=2)
     elif entry.pid is not None:
         with suppress(ProcessLookupError, OSError):
-            os.kill(entry.pid, 15)  # SIGTERM
+            os.kill(entry.pid, signal.SIGTERM)
     entry.pid = None
 
 
@@ -185,23 +187,44 @@ async def _plugin_supervisor() -> None:
                 await _launch_plugin(entry)
 
 
+_bg_started = False
+
+
 @asynccontextmanager
 async def _lifespan(app: Any):
-    purge_task = asyncio.create_task(_background_purge())
-    # Auto-start plugins registered before broker boot
-    for entry in list(plugins.values()):
-        if entry.auto_start and not _plugin_is_running(entry):
-            await _launch_plugin(entry)
-    supervisor_task = asyncio.create_task(_plugin_supervisor())
-    try:
-        yield
-    finally:
-        supervisor_task.cancel()
-        purge_task.cancel()
+    # IMPORTANT: FastMCP / the Streamable-HTTP session manager may enter and
+    # exit this lifespan context MORE THAN ONCE during a single broker process
+    # (observed: a fresh enter/exit cycle every few minutes). We must therefore:
+    #   1. start background tasks + auto-launch plugins exactly ONCE, and
+    #   2. NOT terminate plugins on context exit — doing so killed every plugin
+    #      on each spurious cycle (~6 min), which silently broke stall/idle
+    #      detection.
+    # Plugin processes are cleaned up via the atexit hook on real process exit.
+    global _bg_started
+    if not _bg_started:
+        _bg_started = True
+        asyncio.create_task(_background_purge())
         for entry in list(plugins.values()):
-            if _plugin_is_running(entry):
-                await _terminate_plugin(entry)
-        await asyncio.gather(supervisor_task, purge_task, return_exceptions=True)
+            if entry.auto_start and not _plugin_is_running(entry):
+                await _launch_plugin(entry)
+        asyncio.create_task(_plugin_supervisor())
+    yield
+
+
+def _terminate_all_plugins_atexit() -> None:
+    """Best-effort SIGTERM to every plugin process when the broker exits.
+
+    Runs synchronously at interpreter shutdown (the asyncio loop is gone by
+    then, so we cannot use _terminate_plugin). Plugins handle SIGTERM by
+    exiting their asyncio.run, so this is a clean stop.
+    """
+    for entry in list(plugins.values()):
+        if entry.pid:
+            with suppress(ProcessLookupError, OSError):
+                os.kill(entry.pid, signal.SIGTERM)
+
+
+atexit.register(_terminate_all_plugins_atexit)
 
 
 mcp = FastMCP("broker", lifespan=_lifespan)

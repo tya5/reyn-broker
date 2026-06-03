@@ -476,9 +476,14 @@ class BrokerPlugin:
         while True:
             await asyncio.sleep(self.inbox_interval)
             try:
+                # Fetch ALL fields, not just from/message: session events
+                # (active_changed / status_changed / posted / ...) carry their
+                # payload in fields like ``event`` / ``active`` / ``session_id``.
+                # Restricting to ["from","message"] would strip those and make
+                # event-driven plugins silently no-op in on_broker_message.
                 result = await cs.call_tool(
                     "receive_messages",
-                    {"session_id": self.session_id, "fields": ["from", "message"]},
+                    {"session_id": self.session_id},
                 )
                 msgs = _parse_result(result)
                 if isinstance(msgs, list):

@@ -2,6 +2,28 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.15.1] - 2026-06-04
+
+### Fixed
+- **Plugins were silently killed every few minutes, breaking stall/idle
+  detection.** The FastMCP / Streamable-HTTP lifespan context can enter and
+  exit more than once during a single broker process. The lifespan's `finally`
+  block terminated every plugin on each exit, so auto_start plugins (telegram,
+  ci-watcher, github-pr-watcher, peer-idle-notifier) were SIGTERM'd roughly
+  every 6 minutes and relaunched. Session events delivered while a plugin was
+  down were never processed — e.g. peer-idle-notifier missed `active_changed`
+  edges and never emitted PEER_IDLE. Fix:
+  - background tasks + plugin auto-launch now run exactly once (guarded by
+    `_bg_started`), even if the lifespan is entered repeatedly;
+  - the lifespan no longer terminates plugins on context exit;
+  - plugin cleanup moved to an `atexit` hook that fires on real process exit.
+- **Event-driven plugins never processed session events.** `BrokerPlugin`'s
+  inbox loop fetched `receive_messages` with `fields=["from","message"]`, which
+  stripped event payload fields (`event` / `active` / `session_id` / …).
+  `on_broker_message` saw no `event` key and returned immediately, so
+  `peer_idle_notifier` never emitted PEER_IDLE despite events being delivered.
+  The inbox loop now fetches all fields.
+
 ## [0.15.0] - 2026-06-03
 
 ### Added

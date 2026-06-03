@@ -1,6 +1,6 @@
 [project]
 name = "reyn-broker"
-version = "0.15.0"
+version = "0.15.1"
 description = "A small MCP broker that lets multiple Claude Code sessions exchange messages by session id."
 readme = "README.md"
 license = "MIT"
