@@ -2,6 +2,44 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.14.0] - 2026-06-03
+
+### Added
+- **`update_session_status(session_id, status, detail)` tool** — sessions
+  explicitly report their activity state (`"active"`, `"idle"`, `"waiting"`,
+  or any custom string). The broker stores the status on `SessionEntry` and
+  fires a `status_changed` event to subscribers. Replaces heuristic inference
+  from `last_post_at` for stall detection.
+- **`status_changed` event type** — new value for `subscribe_session_events`.
+  Payload includes `status` and `detail` fields in addition to the standard
+  `session_id` / `at` fields.
+- **`reyn-broker-status` CLI** (`session_status.py`) — one-shot command for
+  use in Claude Code hooks (Stop, PreToolUse, etc.) where no LLM turn is
+  available. Usage: `reyn-broker-status SESSION_ID STATUS [DETAIL]`.
+- **`BrokerClient.subscribe_events()`** — first-class API on `BrokerClient`
+  replacing the `broker._cs.call_tool("subscribe_session_events", ...)` pattern.
+- **`@command` `sender` parameter** — plugin command methods can declare
+  `sender: str = ""` to receive the caller's session id; injected by the
+  framework, not a user-supplied argument.
+- **Bundled plugins** — `peer_stall_watcher.py` and
+  `plugins/github_pr_watcher.py` added to the package with entry points
+  `reyn-broker-peer-stall` and `reyn-broker-github-pr`.
+
+### Changed
+- `list_sessions` compact shape now includes `"status"` field.
+- `list_sessions` full shape now includes `"status"` and `"status_detail"`.
+- `peer_stall_watcher`: rewritten to subscribe to `status_changed` /
+  `registered` / `unregistered` events — zero `list_sessions` polling.
+  Stall is detected when a session stays in a monitored state (default:
+  `idle` or `waiting`) beyond the threshold.
+  `PEER_STALL_EXCLUDE` replaced by `PEER_STALL_WATCH` (opt-in include list).
+- `plugins/github_pr_watcher`: manual `on_broker_message` dispatch replaced
+  with `@command` + `sender` parameter.
+
+### ⚠️ Schema change notice
+New tool `update_session_status`. `list_sessions` compact/full shapes gained
+`status` (and `status_detail` in full). Run `ToolSearch` to refresh schemas.
+
 ## [0.13.1] - 2026-06-03
 
 ### Fixed

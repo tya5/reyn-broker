@@ -207,9 +207,26 @@ receive_messages(session_id="<自分の session_id>", fields=["from", "message"]
 > **⚠️ silent stop（status なしで turn 終了）= protocol 違反**
 
 turn を終える / 停止 / pause / blocked / hand-off / context 切れ が発生する場合、
-**停止前の最後のアクションとして必ず `backlog-watcher` へ stop-status を post すること**。
+以下の **2 ステップ** を停止前の最後のアクションとして実行すること。
 
-### post 内容（3点セット）
+### ステップ 1: ステータスを更新する（broker に明示宣言）
+
+```python
+update_session_status(
+    session_id="<自分の session_id>",
+    status="idle",          # または "waiting" (blocked 時) など
+    detail="done-need-review / blocked-on-<X> / pausing-resume-when-<Y>",
+)
+```
+
+Stop hook からトークン消費なしに設定する場合:
+
+```bash
+# settings.json Stop hook に設定
+reyn-broker-status <session_id> idle "done-need-review"
+```
+
+### ステップ 2: backlog-watcher に stop-status を post する
 
 ```
 post_message(

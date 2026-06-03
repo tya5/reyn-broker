@@ -1,6 +1,6 @@
 [project]
 name = "reyn-broker"
-version = "0.13.1"
+version = "0.14.0"
 description = "A small MCP broker that lets multiple Claude Code sessions exchange messages by session id."
 readme = "README.md"
 license = "MIT"
@@ -37,6 +37,7 @@ reyn-broker-telegram = "telegram_bridge:_entrypoint"
 reyn-broker-github-ci = "plugins.github_ci_watcher:main"
 reyn-broker-github-pr = "plugins.github_pr_watcher:main"
 reyn-broker-peer-stall = "peer_stall_watcher:main"
+reyn-broker-status = "session_status:main"
 
 [project.urls]
 Homepage = "https://github.com/tya5/reyn-broker"
@@ -48,7 +49,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["server", "session_watcher", "telegram_bridge", "plugin_base", "peer_stall_watcher"]
+py-modules = ["server", "session_watcher", "telegram_bridge", "plugin_base", "peer_stall_watcher", "session_status"]
 packages = ["plugins"]
 
 [tool.ruff]

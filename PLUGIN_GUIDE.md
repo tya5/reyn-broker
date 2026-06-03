@@ -168,12 +168,21 @@ msgs = await broker.peek(limit=5)
 
 ```python
 await broker.subscribe_events(
-    event_types=["posted", "registered", "unregistered"],
+    event_types=["status_changed", "registered", "unregistered"],
     session_filter=None,  # None = 全セッション
 )
 ```
 
 `list_sessions` ポーリングの代わりにイベント購読を使うことでブローカー負荷を下げられます。イベントは `on_broker_message` に届きます（`msg.get("event")` でイベント種別を確認）。
+
+利用可能なイベント種別:
+
+| イベント | トリガー |
+|---|---|
+| `registered` | `register_session` / `startup_summary` が呼ばれた |
+| `unregistered` | `unregister_session` が呼ばれた / TTL 期限切れ |
+| `posted` | `post_message` / `broadcast_message` が呼ばれた |
+| `status_changed` | `update_session_status` が呼ばれた |
 
 ### ポーリング制御
 

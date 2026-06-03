@@ -704,7 +704,7 @@ async def test_list_sessions_compact_returns_only_id_and_role(broker_url: str) -
             {"session_id": "alice", "working_dir": "/tmp/a", "role": "tester"},
         )
         result = _payload(await a.call_tool("list_sessions", {"compact": True}))
-    assert result == [{"session_id": "alice", "role": "tester"}]
+    assert result == [{"session_id": "alice", "role": "tester", "status": None}]
 
 
 @pytest.mark.asyncio
@@ -979,7 +979,7 @@ async def test_session_ttl_expires_and_removed(broker_url: str) -> None:
 async def test_health_check_returns_expected_fields(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.13.1"
+    assert result["version"] == "0.14.0"
     assert isinstance(result["uptime_seconds"], int)
     assert result["uptime_seconds"] >= 0
     assert result["started_at_iso"].startswith("20")
@@ -1295,4 +1295,4 @@ async def test_plugin_restart(broker_url: str) -> None:
 async def test_health_check_version_updated(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.13.1"
+    assert result["version"] == "0.14.0"

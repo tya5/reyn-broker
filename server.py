@@ -27,7 +27,7 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.13.1"
+_VERSION = "0.14.0"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.
@@ -48,6 +48,8 @@ class SessionEntry:
     last_post_at: str | None = None
     last_receive_at: str | None = None
     session_expires_at: float | None = None  # epoch timestamp; None = no TTL
+    status: str | None = None               # last reported status (e.g. "active", "idle")
+    status_detail: str | None = None        # optional free-form status detail
 
 
 @dataclass
@@ -63,7 +65,7 @@ class PluginEntry:
 @dataclass
 class EventSubscription:
     subscriber_id: str
-    event_types: set[str]                      # "registered" | "unregistered" | "posted"
+    event_types: set[str]  # "registered"|"unregistered"|"posted"|"status_changed"
     session_filter: list[str] | None = None    # None = all sessions
 
 
@@ -220,6 +222,8 @@ def _save_state() -> None:
                     "last_post_at": e.last_post_at,
                     "last_receive_at": e.last_receive_at,
                     "session_expires_at": e.session_expires_at,
+                    "status": e.status,
+                    "status_detail": e.status_detail,
                 }
                 for e in sessions.values()
             ],
@@ -270,6 +274,8 @@ def _load_state() -> None:
             last_post_at=entry.get("last_post_at"),
             last_receive_at=entry.get("last_receive_at"),
             session_expires_at=entry.get("session_expires_at"),
+            status=entry.get("status"),
+            status_detail=entry.get("status_detail"),
         )
     for sid, msgs in data.get("pending", {}).items():
         pending[sid].extend(msgs)
@@ -353,14 +359,25 @@ async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
         return False
 
 
-def _push_session_event_locked(event_type: str, session_id: str) -> None:
+def _push_session_event_locked(
+    event_type: str,
+    session_id: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
     """Queue a session activity event to all matching subscribers.
 
     Caller MUST hold ``registry_lock``. The event is queued as a regular
     broker message so subscribers receive it via their normal inbox drain.
     Events are never delivered to the session that triggered them.
+
+    ``extra`` is merged into the event payload (used for ``status_changed``
+    to carry ``status`` and ``detail`` fields).
     """
     now = _now_iso()
+    payload: dict[str, Any] = {"from": "broker", "event": event_type,
+                                "session_id": session_id, "at": now}
+    if extra:
+        payload.update(extra)
     for sub in event_subscriptions.values():
         if sub.subscriber_id == session_id:
             continue
@@ -368,12 +385,7 @@ def _push_session_event_locked(event_type: str, session_id: str) -> None:
             continue
         if sub.session_filter is not None and session_id not in sub.session_filter:
             continue
-        pending[sub.subscriber_id].append({
-            "from": "broker",
-            "event": event_type,
-            "session_id": session_id,
-            "at": now,
-        })
+        pending[sub.subscriber_id].append(payload)
 
 
 def _register_locked(
@@ -403,7 +415,7 @@ def _session_list_locked(compact: bool) -> list[dict[str, Any]]:
     """Serialise the session registry.  Caller MUST hold ``registry_lock``."""
     if compact:
         return [
-            {"session_id": e.session_id, "role": e.role}
+            {"session_id": e.session_id, "role": e.role, "status": e.status}
             for e in sessions.values()
         ]
     return [
@@ -414,6 +426,8 @@ def _session_list_locked(compact: bool) -> list[dict[str, Any]]:
             "last_post_at": e.last_post_at,
             "last_receive_at": e.last_receive_at,
             "inbox_unread_count": len(_purge_expired(pending.get(e.session_id, []))),
+            "status": e.status,
+            "status_detail": e.status_detail,
         }
         for e in sessions.values()
     ]
@@ -500,6 +514,47 @@ async def unregister_session(session_id: str) -> str:
     if existed is None:
         return f"'{session_id}' was not registered"
     return f"unregistered '{session_id}'"
+
+
+@mcp.tool()
+async def update_session_status(
+    session_id: str,
+    status: str,
+    detail: str | None = None,
+) -> str:
+    """Report this session's current activity status.
+
+    Call this whenever your state changes so that monitoring plugins
+    (e.g. stall watchers) can track you accurately without inferring
+    state from message timestamps.
+
+    Recommended status values (any string is accepted):
+    - ``"active"``  — working on a task.
+    - ``"idle"``    — waiting for user input or nothing to do.
+    - ``"waiting"`` — blocked on an external event (describe in ``detail``).
+
+    The broker fires a ``status_changed`` event to any session subscribed
+    via ``subscribe_session_events``.  The updated status is also visible
+    in ``list_sessions``.
+
+    Callers that cannot make MCP calls (e.g. stop hooks) can use the
+    ``reyn-broker-status`` CLI instead::
+
+        reyn-broker-status SESSION_ID STATUS [DETAIL]
+    """
+    _tool_call_counts["update_session_status"] += 1
+    async with registry_lock:
+        entry = sessions.get(session_id)
+        if entry is None:
+            return f"'{session_id}' is not registered"
+        entry.status = status
+        entry.status_detail = detail
+        _push_session_event_locked(
+            "status_changed", session_id,
+            extra={"status": status, "detail": detail},
+        )
+        _save_state()
+    return f"status updated: '{session_id}' → {status}"
 
 
 @mcp.tool()
@@ -869,7 +924,7 @@ async def get_plugin_commands(session_id: str) -> list[dict[str, Any]]:
 # Session event subscription tools
 # ---------------------------------------------------------------------------
 
-_VALID_EVENT_TYPES = frozenset({"registered", "unregistered", "posted"})
+_VALID_EVENT_TYPES = frozenset({"registered", "unregistered", "posted", "status_changed"})
 
 
 @mcp.tool()
