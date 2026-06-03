@@ -72,8 +72,10 @@ class EventSubscription:
 sessions: dict[str, SessionEntry] = {}
 pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
 plugins: dict[str, PluginEntry] = {}
-# subscriber_id → EventSubscription
-event_subscriptions: dict[str, EventSubscription] = {}
+# subscriber_id → list of independent subscriptions. A session may hold several
+# subscriptions with different event_types / session_filter; an event is
+# delivered at most once per subscriber even if multiple of its subs match.
+event_subscriptions: dict[str, list[EventSubscription]] = {}
 # session_id → list of command dicts ({name, description, args})
 plugin_commands: dict[str, list[dict[str, Any]]] = {}
 registry_lock = asyncio.Lock()
@@ -245,7 +247,8 @@ def _save_state() -> None:
                     "event_types": sorted(s.event_types),
                     "session_filter": s.session_filter,
                 }
-                for s in event_subscriptions.values()
+                for subs in event_subscriptions.values()
+                for s in subs
             ],
         }
         tmp = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
@@ -290,17 +293,17 @@ def _load_state() -> None:
         )
     for sub in data.get("event_subscriptions", []):
         sid = sub["subscriber_id"]
-        event_subscriptions[sid] = EventSubscription(
+        event_subscriptions.setdefault(sid, []).append(EventSubscription(
             subscriber_id=sid,
             event_types=set(sub.get("event_types", [])),
             session_filter=sub.get("session_filter"),
-        )
+        ))
     logger.info(
         "restored state: %d sessions, %d queued messages, %d plugins, %d event subs",
         len(sessions),
         sum(len(v) for v in pending.values()),
         len(plugins),
-        len(event_subscriptions),
+        sum(len(v) for v in event_subscriptions.values()),
     )
 
 
@@ -378,14 +381,18 @@ def _push_session_event_locked(
                                 "session_id": session_id, "at": now}
     if extra:
         payload.update(extra)
-    for sub in event_subscriptions.values():
-        if sub.subscriber_id == session_id:
+    for subscriber_id, subs in event_subscriptions.items():
+        if subscriber_id == session_id:
             continue
-        if event_type not in sub.event_types:
-            continue
-        if sub.session_filter is not None and session_id not in sub.session_filter:
-            continue
-        pending[sub.subscriber_id].append(payload)
+        # Deliver at most once per subscriber, even if several of its
+        # subscriptions match this event.
+        for sub in subs:
+            if event_type not in sub.event_types:
+                continue
+            if sub.session_filter is not None and session_id not in sub.session_filter:
+                continue
+            pending[subscriber_id].append(payload)
+            break
 
 
 def _register_locked(
@@ -548,8 +555,11 @@ async def update_session_status(
     - ``"waiting"`` — blocked on an external event (describe in ``detail``).
 
     The broker fires a ``status_changed`` event to any session subscribed
-    via ``subscribe_session_events``.  The updated status is also visible
-    in ``list_sessions``.
+    via ``subscribe_session_events``.  The event carries the new ``status``,
+    ``detail``, and the ``prev_status`` (the value before this call), so
+    subscribers can detect edges (e.g. active→idle) rather than re-firing on
+    every detail-only update. The updated status is also visible in
+    ``list_sessions``.
 
     Callers that cannot make MCP calls (e.g. stop hooks) can use the
     ``reyn-broker-status`` CLI instead::
@@ -563,11 +573,12 @@ async def update_session_status(
             return f"'{session_id}' is not registered"
         if entry.status == status and entry.status_detail == detail:
             return f"status unchanged: '{session_id}' already {status}"
+        prev_status = entry.status
         entry.status = status
         entry.status_detail = detail
         _push_session_event_locked(
             "status_changed", session_id,
-            extra={"status": status, "detail": detail},
+            extra={"status": status, "detail": detail, "prev_status": prev_status},
         )
         _save_state()
     return f"status updated: '{session_id}' → {status}"
@@ -982,6 +993,14 @@ async def subscribe_session_events(
     ``session_filter`` — optional list of session ids to watch. ``None``
     (default) means watch all sessions.
 
+    A subscriber may hold multiple independent subscriptions: calling this
+    again with a different ``(event_types, session_filter)`` pair adds a
+    separate subscription rather than merging. For example you can watch
+    ``posted`` for session A and ``status_changed`` for session B without the
+    two filters bleeding into each other. An identical pair is not duplicated
+    (idempotent). An event is delivered at most once per subscriber even when
+    several of its subscriptions match.
+
     Subscriptions survive broker restarts (persisted to state file).
     Call ``unsubscribe_session_events`` to cancel.
     """
@@ -989,20 +1008,26 @@ async def subscribe_session_events(
     unknown = set(event_types) - _VALID_EVENT_TYPES
     if unknown:
         return f"unknown event type(s): {sorted(unknown)}; valid: {sorted(_VALID_EVENT_TYPES)}"
+    new_sub = EventSubscription(
+        subscriber_id=subscriber_id,
+        event_types=set(event_types),
+        session_filter=session_filter,
+    )
+
+    def _filter_key(f: list[str] | None) -> frozenset[str] | None:
+        return None if f is None else frozenset(f)
+
     async with registry_lock:
-        existing = event_subscriptions.get(subscriber_id)
-        if existing:
-            existing.event_types.update(event_types)
-            if session_filter is not None:
-                existing.session_filter = (
-                    list(set((existing.session_filter or []) + session_filter))
-                )
-        else:
-            event_subscriptions[subscriber_id] = EventSubscription(
-                subscriber_id=subscriber_id,
-                event_types=set(event_types),
-                session_filter=session_filter,
-            )
+        subs = event_subscriptions.setdefault(subscriber_id, [])
+        # Idempotent: an identical (event_types, session_filter) subscription
+        # is not duplicated. Distinct ones are kept as independent entries.
+        already = any(
+            s.event_types == new_sub.event_types
+            and _filter_key(s.session_filter) == _filter_key(new_sub.session_filter)
+            for s in subs
+        )
+        if not already:
+            subs.append(new_sub)
         _save_state()
     filter_desc = f" (filter: {session_filter})" if session_filter else " (all sessions)"
     return f"'{subscriber_id}' subscribed to {sorted(event_types)}{filter_desc}"
@@ -1015,24 +1040,30 @@ async def unsubscribe_session_events(
 ) -> str:
     """Unsubscribe from session activity events.
 
-    If ``event_types`` is provided, only those event types are removed.
-    If omitted, the entire subscription is cancelled.
+    If ``event_types`` is provided, those event types are removed from ALL of
+    this subscriber's subscriptions. If omitted, every subscription for this
+    subscriber is cancelled.
     """
     _tool_call_counts["unsubscribe_session_events"] += 1
     async with registry_lock:
-        sub = event_subscriptions.get(subscriber_id)
-        if sub is None:
+        subs = event_subscriptions.get(subscriber_id)
+        if not subs:
             return f"'{subscriber_id}' has no active subscription"
         if event_types is None:
+            count = len(subs)
             del event_subscriptions[subscriber_id]
-            msg = f"'{subscriber_id}' fully unsubscribed"
+            msg = f"'{subscriber_id}' fully unsubscribed ({count} subscription(s) removed)"
         else:
-            sub.event_types -= set(event_types)
-            if not sub.event_types:
+            remove = set(event_types)
+            for s in subs:
+                s.event_types -= remove
+            # drop subscriptions left with no event types
+            subs[:] = [s for s in subs if s.event_types]
+            if not subs:
                 del event_subscriptions[subscriber_id]
                 msg = f"'{subscriber_id}' fully unsubscribed (no event types remaining)"
             else:
-                remaining = sorted(sub.event_types)
+                remaining = sorted({et for s in subs for et in s.event_types})
                 msg = f"'{subscriber_id}' removed {event_types}; still watching {remaining}"
         _save_state()
     return msg

@@ -297,7 +297,9 @@ class PeerIdleNotifier(BrokerPlugin):
         if msg.get("event") != "status_changed":
             return
         sid = msg.get("session_id", "")
-        if msg.get("status") == "idle":
+        # Notify only on the transition INTO idle (active→idle), not on an
+        # idle→idle detail edit. Use prev_status to detect the edge.
+        if msg.get("status") == "idle" and msg.get("prev_status") != "idle":
             await broker.post(
                 to="backlog-watcher",
                 message=f"PEER_IDLE: {sid} is ready for new work",
@@ -353,10 +355,16 @@ class PeerIdleNotifier(BrokerPlugin):
 | `event` | `"status_changed"` |
 | `session_id` | 状態を更新したセッション ID |
 | `status` | 新しいステータス文字列（`"active"` / `"idle"` / `"waiting"` など）|
+| `prev_status` | 直前のステータス（`None` の場合あり）。エッジ判定に使う |
 | `detail` | 任意の補足説明（`None` の場合あり）|
 | `at` | 更新時刻 |
 
-**トリガー**: `update_session_status` が呼ばれ、かつ status または detail が変化したとき（before == after の場合はイベント発火なし）。
+**トリガー**: `update_session_status` が呼ばれ、かつ status **または** detail が変化したとき（両方同一なら発火なし）。
+
+> **⚠️ detail だけの変化でも発火する**: `(idle, A) → (idle, B)` のように status が
+> idle のままでも detail が変われば `status_changed` が発火する。「idle への遷移」だけに
+> 反応したい監視プラグインは `status == "idle" and prev_status != "idle"` のように
+> **`prev_status` でエッジ判定**すること（さもないと detail 編集を新規 idle と誤認する）。
 
 ---
 

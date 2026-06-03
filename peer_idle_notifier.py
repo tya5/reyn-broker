@@ -59,7 +59,11 @@ class PeerIdleNotifier(BrokerPlugin):
         if not sid or not self._should_watch(sid):
             return
         status = msg.get("status", "")
-        if status in _IDLE_STATES:
+        prev = msg.get("prev_status")
+        # Only notify on the *transition* into an idle state. A change that
+        # stays within idle states (e.g. an idle detail edit: idle→idle) must
+        # not re-fire, otherwise a detail update looks like a fresh idle.
+        if status in _IDLE_STATES and prev not in _IDLE_STATES:
             detail = msg.get("detail") or ""
             text = f"PEER_IDLE: {sid} → {status}"
             if detail:

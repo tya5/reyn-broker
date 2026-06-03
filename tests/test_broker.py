@@ -1296,3 +1296,85 @@ async def test_health_check_version_updated(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
     assert result["version"] == "0.14.0"
+
+
+# ---------------------------------------------------------------------------
+# subscribe_session_events — multiple independent subscriptions
+# ---------------------------------------------------------------------------
+
+
+def _events(msgs: list[dict]) -> list[tuple]:
+    return [(m.get("event"), m.get("session_id")) for m in msgs if m.get("from") == "broker"]
+
+
+@pytest.mark.asyncio
+async def test_independent_subscriptions_do_not_bleed(broker_url: str) -> None:
+    """A subscriber can hold (posted@A) and (status_changed@B) without mixing."""
+    async with _client(broker_url) as s, _client(broker_url) as a, _client(broker_url) as b:
+        await s.call_tool("register_session", {"session_id": "sub", "working_dir": "/tmp/s"})
+        await a.call_tool("register_session", {"session_id": "A", "working_dir": "/tmp/a"})
+        await b.call_tool("register_session", {"session_id": "B", "working_dir": "/tmp/b"})
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["posted"], "session_filter": ["A"],
+        })
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["status_changed"], "session_filter": ["B"],
+        })
+        await s.call_tool("receive_messages", {"session_id": "sub"})  # clear noise
+        await a.call_tool("post_message", {"to": "x", "from_session": "A", "message": "m"})
+        await a.call_tool("update_session_status", {"session_id": "A", "status": "idle"})
+        await b.call_tool("update_session_status", {"session_id": "B", "status": "idle"})
+        await b.call_tool("post_message", {"to": "x", "from_session": "B", "message": "m"})
+        events = _events(_payload(await s.call_tool("receive_messages", {"session_id": "sub"})))
+    assert ("posted", "A") in events
+    assert ("status_changed", "B") in events
+    assert ("status_changed", "A") not in events  # A's status not watched
+    assert ("posted", "B") not in events          # B's posts not watched
+
+
+@pytest.mark.asyncio
+async def test_event_delivered_once_per_subscriber(broker_url: str) -> None:
+    """Two overlapping subscriptions both matching an event → delivered once."""
+    async with _client(broker_url) as s, _client(broker_url) as a:
+        await s.call_tool("register_session", {"session_id": "sub", "working_dir": "/tmp/s"})
+        await a.call_tool("register_session", {"session_id": "A", "working_dir": "/tmp/a"})
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["posted"],
+        })
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["posted", "status_changed"],
+        })
+        await s.call_tool("receive_messages", {"session_id": "sub"})
+        await a.call_tool("post_message", {"to": "x", "from_session": "A", "message": "m"})
+        msgs = _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
+    posted = [m for m in msgs if m.get("event") == "posted"]
+    assert len(posted) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_changed_carries_prev_status(broker_url: str) -> None:
+    """status_changed events carry prev_status for edge detection."""
+    async with _client(broker_url) as s, _client(broker_url) as a:
+        await s.call_tool("register_session", {"session_id": "sub", "working_dir": "/tmp/s"})
+        await a.call_tool("register_session", {"session_id": "A", "working_dir": "/tmp/a"})
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["status_changed"], "session_filter": ["A"],
+        })
+        await s.call_tool("receive_messages", {"session_id": "sub"})
+        await a.call_tool("update_session_status", {"session_id": "A", "status": "active"})
+        await a.call_tool("update_session_status", {
+            "session_id": "A", "status": "idle", "detail": "first",
+        })
+        # idle→idle detail edit: still fires, but prev_status stays idle
+        await a.call_tool("update_session_status", {
+            "session_id": "A", "status": "idle", "detail": "second",
+        })
+        msgs = [m for m in _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
+                if m.get("event") == "status_changed"]
+    transitions = [(m.get("prev_status"), m.get("status")) for m in msgs]
+    assert (None, "active") in transitions       # first edge: unset → active
+    assert ("active", "idle") in transitions     # the real idle edge
+    assert ("idle", "idle") in transitions       # detail-only edit still fires
+    # An edge-detecting consumer (prev != idle, status == idle) sees one idle edge.
+    idle_edges = [t for t in transitions if t[1] == "idle" and t[0] != "idle"]
+    assert len(idle_edges) == 1
