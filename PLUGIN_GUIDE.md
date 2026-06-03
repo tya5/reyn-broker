@@ -122,6 +122,18 @@ get_plugin_commands("echo")
 # → [{"name": "echo", "description": "Echo a message back", "args": ["text"]}]
 ```
 
+### `broker` 引数の規約
+
+`@command` で宣言するメソッドは必ず最後の引数として `broker: BrokerClient` を受け取ってください。これはフレームワークが自動的に注入します。省略すると `TypeError` が発生し、呼び出し元にエラー返信が届きます。
+
+```python
+# ✅ 正しい
+async def watch(self, pr_number: str, broker: BrokerClient) -> str: ...
+
+# ❌ broker 引数が無い
+async def watch(self, pr_number: str) -> str: ...
+```
+
 ### on_broker_message へのフォールバック
 
 どのコマンドにもマッチしないメッセージは `on_broker_message` に渡されます。自由形式のメッセージや help レスポンスの実装に使います。
@@ -322,6 +334,20 @@ plugin_list()
 ```
 
 登録情報は state ファイルに永続化されます。`auto_start=True` のプラグインは broker 起動時に自動起動します。
+
+### クラッシュ時の自動再起動
+
+`auto_start=True` のプラグインは broker が 10 秒ごとに死活確認し、クラッシュしていれば自動再起動します。監視プラグイン（stall watcher、CI watcher 等）が静かに死んだままになることを防ぎます。
+
+### ログ
+
+プラグインの stderr は以下に追記されます:
+
+```
+~/.local/state/reyn-broker/plugins/<name>.log
+```
+
+クラッシュ時の診断はここを確認してください。
 
 ---
 

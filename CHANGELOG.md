@@ -2,6 +2,19 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.13.1] - 2026-06-03
+
+### Fixed
+- **Plugin subprocess robustness** — three safety gaps addressed:
+  - `_terminate_plugin`: added SIGKILL fallback after SIGTERM + 5 s timeout.
+    A hung plugin no longer lingers indefinitely.
+  - `_plugin_supervisor`: new asyncio task (started in `_lifespan`) checks every
+    10 s whether any `auto_start` plugin has crashed and restarts it automatically.
+    Prevents silent death of monitoring plugins (stall watcher, CI watcher, etc.).
+  - `_launch_plugin`: stderr is now redirected to
+    `~/.local/state/reyn-broker/plugins/<name>.log` (append mode) instead of
+    `/dev/null`. Crash diagnostics are preserved across restarts.
+
 ## [0.10.0] - 2026-05-30
 
 ### Added
