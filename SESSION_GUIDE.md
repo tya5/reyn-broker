@@ -429,6 +429,11 @@ startup_summary(session_id="temp-reviewer", working_dir=..., role="PR review", t
 | `receive_messages` | `session_id`, `fields?` | 自分の inbox を drain。**`fields=["from","message"]` で不要な metadata を除いてトークン削減** |
 | `peek_messages` | `session_id`, `limit?` (default 10), `fields?` | **非破壊コンテンツ確認** — inbox を drain せず内容を確認。割り込み要否の triage に |
 | `inbox_stats` | `session_id` | 非破壊 peek: `{pending_count, senders}`。自分の確認より**相手の確認**に使う |
+| `update_session_status` | `session_id`, `status`, `detail?` | 自分の状態を宣言（`"active"` / `"idle"` / `"waiting"` など）。変化時のみ `status_changed` イベントを発火。`reyn-broker-status` CLI で stop hook からも呼べる |
+| `get_session_status` | `session_id` | 1 セッションの現在状態を broker に問い合わせ。`{registered, status, status_detail}` を返す |
+| `subscribe_session_events` | `subscriber_id`, `event_types`, `session_filter?` | セッションイベント（`registered` / `unregistered` / `posted` / `status_changed`）を inbox 経由で受け取る。プラグインは `BrokerClient.subscribe_events()` を使用 |
+| `unsubscribe_session_events` | `subscriber_id` | イベント購読を解除 |
+| `tool_stats` | *(なし)* | ツール呼び出し回数の統計。token コスト分析に |
 | `health_check` | *(なし)* | broker の version / uptime / session_count / total_pending を返す。再起動後の確認に |
 | `unregister_session` | `session_id` | 終了前に 1 回 |
 
