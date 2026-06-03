@@ -37,6 +37,11 @@ Operational notes:
     same session_id fails to acquire the lock and exits immediately (code 2).
     Without this, concurrent watchers race over the inbox and a message
     drained by the wrong one is silently lost to the intended consumer.
+  - Recovery: the loser's stderr names the holder's pid. If that watcher is
+    genuinely stale, ``kill <pid>`` and relaunch — the lock auto-releases on
+    process exit (kernel-managed), so no stale lock is left behind and the
+    relaunch succeeds. If the holder is healthy, the loser was the mistake
+    (you already have a working watcher); do nothing.
   - Transient broker outages back off ``ERROR_BACKOFF_S`` and stay quiet
     until 5 consecutive failures, then emit a single ``_watcher_error``
     line so the Claude Code session can see something is wrong.
@@ -98,17 +103,25 @@ def _acquire_single_instance_lock(session_id: str):
     safe = _SAFE_SENDER_RE.sub("_", session_id)[:64] or "unknown"
     JOURNAL_BASE.mkdir(parents=True, exist_ok=True)
     lock_path = JOURNAL_BASE / f".watcher-{safe}.lock"
-    lock_fh = open(lock_path, "w")  # noqa: SIM115 — held for process lifetime, not a with-block
+    # Open with "a+" (not "w") so we do NOT truncate the holder's pid before we
+    # know whether we won the lock — a loser must still be able to read it.
+    lock_fh = open(lock_path, "a+")  # noqa: SIM115 — held for process lifetime, not a with-block
     try:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        lock_fh.seek(0)
+        holder_pid = lock_fh.read().strip() or "unknown"
         lock_fh.close()
         sys.stderr.write(
             f"[session_watcher] a watcher for session '{session_id}' is already "
-            f"running (lock: {lock_path}). Refusing to start a second instance — "
-            f"concurrent watchers race over the inbox and silently drop messages.\n"
+            f"running (pid {holder_pid}, lock: {lock_path}). Refusing to start a "
+            f"second instance — concurrent watchers race over the inbox and "
+            f"silently drop messages. If that pid is stale, kill it and retry.\n"
         )
         sys.exit(2)
+    # We hold the lock: now it is safe to record our pid for any future loser.
+    lock_fh.seek(0)
+    lock_fh.truncate()
     lock_fh.write(str(os.getpid()))
     lock_fh.flush()
     return lock_fh
