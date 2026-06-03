@@ -162,6 +162,15 @@ class BrokerClient:
     # Messaging
     # ------------------------------------------------------------------
 
+    async def get_status(self, session_id: str) -> dict[str, Any]:
+        """Return the authoritative status of a session from the broker registry.
+
+        Use this before acting on a delayed state check to guard against
+        missed events that could leave local state stale.
+        """
+        result = await self._cs.call_tool("get_session_status", {"session_id": session_id})
+        return _parse_result(result) or {}
+
     async def subscribe_events(
         self,
         event_types: list[str],
