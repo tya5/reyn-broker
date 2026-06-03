@@ -547,6 +547,8 @@ async def update_session_status(
         entry = sessions.get(session_id)
         if entry is None:
             return f"'{session_id}' is not registered"
+        if entry.status == status and entry.status_detail == detail:
+            return f"status unchanged: '{session_id}' already {status}"
         entry.status = status
         entry.status_detail = detail
         _push_session_event_locked(
@@ -555,6 +557,32 @@ async def update_session_status(
         )
         _save_state()
     return f"status updated: '{session_id}' → {status}"
+
+
+@mcp.tool()
+async def get_session_status(session_id: str) -> dict[str, Any]:
+    """Return the current status of a single session.
+
+    Provides an authoritative snapshot from the broker registry.  Use this
+    to confirm a session's status before acting on it — particularly useful
+    in delayed checks where in-memory state may be stale due to missed events.
+
+    Returns a dict with ``session_id``, ``status``, ``status_detail``, and
+    ``registered`` (bool).  If the session is not registered, ``registered``
+    is ``False`` and ``status`` / ``status_detail`` are ``None``.
+    """
+    _tool_call_counts["get_session_status"] += 1
+    async with registry_lock:
+        entry = sessions.get(session_id)
+    if entry is None:
+        return {"session_id": session_id, "registered": False,
+                "status": None, "status_detail": None}
+    return {
+        "session_id": session_id,
+        "registered": True,
+        "status": entry.status,
+        "status_detail": entry.status_detail,
+    }
 
 
 @mcp.tool()
