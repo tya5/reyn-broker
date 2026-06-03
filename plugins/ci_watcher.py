@@ -23,19 +23,13 @@ Broker protocol
 ---------------
 To watch a PR, send a message to the ``ci-watcher`` session::
 
-    post_message(
-        to="ci-watcher",
-        from_session="my-session",
-        message="watch:#1268",
-    )
-
-To stop watching::
-
+    post_message(to="ci-watcher", from_session="my-session", message="watch:#1268")
     post_message(to="ci-watcher", from_session="my-session", message="unwatch:#1268")
+    post_message(to="ci-watcher", from_session="my-session", message="list")
 
-When CI status changes, ``ci-watcher`` posts back to the requesting session::
+When CI status changes, ``ci-watcher`` posts back to all requesting sessions::
 
-    {"from": "ci-watcher", "message": "CI #1268: SUCCESS (all checks passed)"}
+    {"from": "ci-watcher", "message": "✅ CI #1268: SUCCESS"}
 
 Environment variables
 ---------------------
@@ -49,12 +43,10 @@ import json
 import logging
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from mcp import ClientSession
-
-from plugin_base import BrokerPlugin
+from plugin_base import BrokerClient, BrokerPlugin
 
 logger = logging.getLogger("broker.plugin.ci_watcher")
 
@@ -64,8 +56,8 @@ _CI_POLL_S = int(os.environ.get("CI_POLL_S", "60"))
 @dataclass
 class WatchedPR:
     pr_number: str
-    requester: str                    # session_id to notify
-    last_status: str | None = None    # last seen overall status
+    requesters: set[str] = field(default_factory=set)  # fan-out: all sessions to notify
+    last_status: str | None = None
 
 
 def _gh_pr_status(pr_number: str) -> str | None:
@@ -97,63 +89,66 @@ def _gh_pr_status(pr_number: str) -> str | None:
 class CiWatcherPlugin(BrokerPlugin):
     session_id = "ci-watcher"
     role = "GitHub CI poll → broker relay"
+    # poll_interval=None: polling starts only when a PR is watched
 
     def __init__(self) -> None:
-        self._watched: dict[str, WatchedPR] = {}  # pr_number → WatchedPR
+        self._watched: dict[str, WatchedPR] = {}
+        self._lock = asyncio.Lock()
 
-    async def on_message(self, msg: dict[str, Any], cs: ClientSession) -> None:
-        """Handle watch/unwatch commands from other sessions."""
+    async def on_broker_message(self, msg: dict[str, Any], broker: BrokerClient) -> None:
+        """Handle watch/unwatch/list commands from other sessions."""
         text = msg.get("message", "").strip()
         requester = msg.get("from", "")
 
         if text.startswith("watch:#"):
             pr_num = text[7:].strip()
-            self._watched[pr_num] = WatchedPR(pr_number=pr_num, requester=requester)
+            async with self._lock:
+                if pr_num not in self._watched:
+                    self._watched[pr_num] = WatchedPR(pr_number=pr_num)
+                self._watched[pr_num].requesters.add(requester)
+                if not broker._poll.running:
+                    broker.start_poll(_CI_POLL_S)
             logger.info("watching PR #%s for %s", pr_num, requester)
-            await cs.call_tool("post_message", {
-                "to": requester,
-                "from_session": self.session_id,
-                "message": f"CI watching: PR #{pr_num} (poll every {_CI_POLL_S}s)",
-            })
+            await broker.post(
+                to=requester,
+                message=f"CI watching: PR #{pr_num} (poll every {_CI_POLL_S}s)",
+            )
 
         elif text.startswith("unwatch:#"):
             pr_num = text[9:].strip()
-            if pr_num in self._watched:
-                del self._watched[pr_num]
-                await cs.call_tool("post_message", {
-                    "to": requester,
-                    "from_session": self.session_id,
-                    "message": f"CI unwatched: PR #{pr_num}",
-                })
+            async with self._lock:
+                if pr_num in self._watched:
+                    self._watched[pr_num].requesters.discard(requester)
+                    if not self._watched[pr_num].requesters:
+                        del self._watched[pr_num]
+                if not self._watched:
+                    broker.stop_poll()
+            await broker.post(to=requester, message=f"CI unwatched: PR #{pr_num}")
 
         elif text == "list":
-            watching = list(self._watched.keys())
-            await cs.call_tool("post_message", {
-                "to": requester,
-                "from_session": self.session_id,
-                "message": f"CI watching: {watching or 'none'}",
-            })
+            async with self._lock:
+                watching = list(self._watched.keys())
+            await broker.post(to=requester, message=f"CI watching: {watching or 'none'}")
 
-    async def run_tasks(self, cs: ClientSession) -> list[asyncio.Task]:
-        return [asyncio.create_task(self._ci_poll_loop(cs))]
-
-    async def _ci_poll_loop(self, cs: ClientSession) -> None:
-        while True:
-            await asyncio.sleep(_CI_POLL_S)
-            for pr_num, watch in list(self._watched.items()):
-                status = await asyncio.to_thread(_gh_pr_status, pr_num)
-                if status is None or status == watch.last_status:
-                    continue
-                watch.last_status = status
-                emoji = {"success": "✅", "failure": "❌", "pending": "⏳"}.get(status, "ℹ️")
-                await cs.call_tool("post_message", {
-                    "to": watch.requester,
-                    "from_session": self.session_id,
-                    "message": f"{emoji} CI #{pr_num}: {status.upper()}",
-                })
-                logger.info(
-                    "PR #%s status → %s, notified %s", pr_num, status, watch.requester
+    async def on_poll(self, broker: BrokerClient) -> None:
+        """Check CI status for all watched PRs and notify requesters on change."""
+        async with self._lock:
+            snapshot = list(self._watched.items())
+        for pr_num, watch in snapshot:
+            # asyncio.to_thread keeps the event loop unblocked during subprocess call
+            status = await asyncio.to_thread(_gh_pr_status, pr_num)
+            if status is None or status == watch.last_status:
+                continue
+            watch.last_status = status
+            emoji = {"success": "✅", "failure": "❌", "pending": "⏳"}.get(status, "ℹ️")
+            async with self._lock:
+                requesters = set(watch.requesters)
+            for requester in requesters:
+                await broker.post(
+                    to=requester,
+                    message=f"{emoji} CI #{pr_num}: {status.upper()}",
                 )
+            logger.info("PR #%s status → %s, notified %s", pr_num, status, requesters)
 
 
 def main() -> None:
