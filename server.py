@@ -60,9 +60,18 @@ class PluginEntry:
     pid: int | None = None                    # last known PID (None = never started)
 
 
+@dataclass
+class EventSubscription:
+    subscriber_id: str
+    event_types: set[str]                      # "registered" | "unregistered" | "posted"
+    session_filter: list[str] | None = None    # None = all sessions
+
+
 sessions: dict[str, SessionEntry] = {}
 pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
 plugins: dict[str, PluginEntry] = {}
+# subscriber_id → EventSubscription
+event_subscriptions: dict[str, EventSubscription] = {}
 # session_id → list of command dicts ({name, description, args})
 plugin_commands: dict[str, list[dict[str, Any]]] = {}
 registry_lock = asyncio.Lock()
@@ -196,6 +205,14 @@ def _save_state() -> None:
                 }
                 for p in plugins.values()
             ],
+            "event_subscriptions": [
+                {
+                    "subscriber_id": s.subscriber_id,
+                    "event_types": sorted(s.event_types),
+                    "session_filter": s.session_filter,
+                }
+                for s in event_subscriptions.values()
+            ],
         }
         tmp = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False))
@@ -235,12 +252,19 @@ def _load_state() -> None:
             auto_start=p.get("auto_start", False),
             pid=p.get("pid"),
         )
+    for sub in data.get("event_subscriptions", []):
+        sid = sub["subscriber_id"]
+        event_subscriptions[sid] = EventSubscription(
+            subscriber_id=sid,
+            event_types=set(sub.get("event_types", [])),
+            session_filter=sub.get("session_filter"),
+        )
     logger.info(
-        "restored state: %d sessions, %d queued messages across %d inboxes, %d plugins",
+        "restored state: %d sessions, %d queued messages, %d plugins, %d event subs",
         len(sessions),
         sum(len(v) for v in pending.values()),
-        len(pending),
         len(plugins),
+        len(event_subscriptions),
     )
 
 
@@ -299,6 +323,29 @@ async def _deliver(target_id: str, payload: dict[str, Any]) -> bool:
         return False
 
 
+def _push_session_event_locked(event_type: str, session_id: str) -> None:
+    """Queue a session activity event to all matching subscribers.
+
+    Caller MUST hold ``registry_lock``. The event is queued as a regular
+    broker message so subscribers receive it via their normal inbox drain.
+    Events are never delivered to the session that triggered them.
+    """
+    now = _now_iso()
+    for sub in event_subscriptions.values():
+        if sub.subscriber_id == session_id:
+            continue
+        if event_type not in sub.event_types:
+            continue
+        if sub.session_filter is not None and session_id not in sub.session_filter:
+            continue
+        pending[sub.subscriber_id].append({
+            "from": "broker",
+            "event": event_type,
+            "session_id": session_id,
+            "at": now,
+        })
+
+
 def _register_locked(
     session_id: str,
     working_dir: str,
@@ -318,6 +365,7 @@ def _register_locked(
         session_expires_at=session_expires_at,
     )
     backlog = _drain_inbox_locked(session_id)
+    _push_session_event_locked("registered", session_id)
     return f"registered '{session_id}' at {working_dir}", backlog
 
 
@@ -417,6 +465,7 @@ async def unregister_session(session_id: str) -> str:
     async with registry_lock:
         existed = sessions.pop(session_id, None)
         if existed is not None:
+            _push_session_event_locked("unregistered", session_id)
             _save_state()
     if existed is None:
         return f"'{session_id}' was not registered"
@@ -505,6 +554,7 @@ async def post_message(
         if _MONITOR_SID and _MONITOR_SID not in targets and from_session != _MONITOR_SID:
             monitor_to = targets[0] if len(targets) == 1 else targets
             pending[_MONITOR_SID].append({**_strip_internal(payload), "monitor_to": monitor_to})
+        _push_session_event_locked("posted", from_session)
         _save_state()
 
     for target in online:
@@ -565,6 +615,7 @@ async def broadcast_message(
             sessions[from_session].last_post_at = sent_at
         if _MONITOR_SID and _MONITOR_SID not in targets and from_session != _MONITOR_SID:
             pending[_MONITOR_SID].append({**_strip_internal(payload), "monitor_to": targets})
+        _push_session_event_locked("posted", from_session)
         _save_state()
 
     for sid in targets:
@@ -782,6 +833,97 @@ async def get_plugin_commands(session_id: str) -> list[dict[str, Any]]:
     """
     _tool_call_counts["get_plugin_commands"] += 1
     return plugin_commands.get(session_id, [])
+
+
+# ---------------------------------------------------------------------------
+# Session event subscription tools
+# ---------------------------------------------------------------------------
+
+_VALID_EVENT_TYPES = frozenset({"registered", "unregistered", "posted"})
+
+
+@mcp.tool()
+async def subscribe_session_events(
+    subscriber_id: str,
+    event_types: list[str],
+    session_filter: list[str] | None = None,
+) -> str:
+    """Subscribe to session activity events.
+
+    When a matching event occurs, the broker queues a lightweight notification
+    to ``subscriber_id``'s inbox::
+
+        {"from": "broker", "event": "<type>", "session_id": "<who>", "at": "<iso>"}
+
+    Drain via ``receive_messages`` as usual. The event is never delivered to
+    the session that triggered it (no self-notification).
+
+    ``event_types`` — one or more of:
+
+    - ``"registered"`` — a session called ``register_session`` or
+      ``startup_summary``.
+    - ``"unregistered"`` — a session called ``unregister_session`` or was
+      removed by TTL expiry.
+    - ``"posted"`` — a session called ``post_message`` or
+      ``broadcast_message`` (i.e. their ``last_post_at`` was updated).
+
+    ``session_filter`` — optional list of session ids to watch. ``None``
+    (default) means watch all sessions.
+
+    Subscriptions survive broker restarts (persisted to state file).
+    Call ``unsubscribe_session_events`` to cancel.
+    """
+    _tool_call_counts["subscribe_session_events"] += 1
+    unknown = set(event_types) - _VALID_EVENT_TYPES
+    if unknown:
+        return f"unknown event type(s): {sorted(unknown)}; valid: {sorted(_VALID_EVENT_TYPES)}"
+    async with registry_lock:
+        existing = event_subscriptions.get(subscriber_id)
+        if existing:
+            existing.event_types.update(event_types)
+            if session_filter is not None:
+                existing.session_filter = (
+                    list(set((existing.session_filter or []) + session_filter))
+                )
+        else:
+            event_subscriptions[subscriber_id] = EventSubscription(
+                subscriber_id=subscriber_id,
+                event_types=set(event_types),
+                session_filter=session_filter,
+            )
+        _save_state()
+    filter_desc = f" (filter: {session_filter})" if session_filter else " (all sessions)"
+    return f"'{subscriber_id}' subscribed to {sorted(event_types)}{filter_desc}"
+
+
+@mcp.tool()
+async def unsubscribe_session_events(
+    subscriber_id: str,
+    event_types: list[str] | None = None,
+) -> str:
+    """Unsubscribe from session activity events.
+
+    If ``event_types`` is provided, only those event types are removed.
+    If omitted, the entire subscription is cancelled.
+    """
+    _tool_call_counts["unsubscribe_session_events"] += 1
+    async with registry_lock:
+        sub = event_subscriptions.get(subscriber_id)
+        if sub is None:
+            return f"'{subscriber_id}' has no active subscription"
+        if event_types is None:
+            del event_subscriptions[subscriber_id]
+            msg = f"'{subscriber_id}' fully unsubscribed"
+        else:
+            sub.event_types -= set(event_types)
+            if not sub.event_types:
+                del event_subscriptions[subscriber_id]
+                msg = f"'{subscriber_id}' fully unsubscribed (no event types remaining)"
+            else:
+                remaining = sorted(sub.event_types)
+                msg = f"'{subscriber_id}' removed {event_types}; still watching {remaining}"
+        _save_state()
+    return msg
 
 
 # ---------------------------------------------------------------------------
