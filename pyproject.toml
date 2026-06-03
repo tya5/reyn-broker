@@ -36,7 +36,7 @@ reyn-broker = "server:main"
 reyn-broker-telegram = "telegram_bridge:_entrypoint"
 reyn-broker-github-ci = "plugins.github_ci_watcher:main"
 reyn-broker-github-pr = "plugins.github_pr_watcher:main"
-reyn-broker-peer-stall = "peer_stall_watcher:main"
+reyn-broker-peer-idle = "peer_idle_notifier:main"
 reyn-broker-status = "session_status:main"
 
 [project.urls]
@@ -49,7 +49,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["server", "session_watcher", "telegram_bridge", "plugin_base", "peer_stall_watcher", "session_status"]
+py-modules = ["server", "session_watcher", "telegram_bridge", "plugin_base", "peer_idle_notifier", "session_status"]
 packages = ["plugins"]
 
 [tool.ruff]

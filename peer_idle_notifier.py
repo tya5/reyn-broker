@@ -28,7 +28,7 @@ from typing import Any
 
 from plugin_base import BrokerClient, BrokerPlugin
 
-logger = logging.getLogger("broker.plugin.peer_stall_watcher")
+logger = logging.getLogger("broker.plugin.peer_idle_notifier")
 
 _NOTIFY_TARGET = os.environ.get("PEER_IDLE_NOTIFY", "backlog-watcher")
 _WATCH_LIST: frozenset[str] | None = (
@@ -39,8 +39,8 @@ _IDLE_STATES: frozenset[str] = frozenset(
 )
 
 
-class PeerStallWatcher(BrokerPlugin):
-    session_id = "peer-stall-watcher"
+class PeerIdleNotifier(BrokerPlugin):
+    session_id = "peer-idle-notifier"
     role = "peer idle detection — notifies immediately on status → idle"
 
     def _should_watch(self, sid: str) -> bool:
@@ -74,9 +74,9 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     try:
-        asyncio.run(PeerStallWatcher().run())
+        asyncio.run(PeerIdleNotifier().run())
     except KeyboardInterrupt:
-        print("[peer-stall-watcher] stopped", file=sys.stderr)
+        print("[peer-idle-notifier] stopped", file=sys.stderr)
 
 
 if __name__ == "__main__":

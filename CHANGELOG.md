@@ -21,18 +21,18 @@ All notable changes to reyn-broker are documented in this file.
 - **`@command` `sender` parameter** — plugin command methods can declare
   `sender: str = ""` to receive the caller's session id; injected by the
   framework, not a user-supplied argument.
-- **Bundled plugins** — `peer_stall_watcher.py` and
+- **Bundled plugins** — `peer_idle_notifier.py` and
   `plugins/github_pr_watcher.py` added to the package with entry points
-  `reyn-broker-peer-stall` and `reyn-broker-github-pr`.
+  `reyn-broker-peer-idle` and `reyn-broker-github-pr`.
 
 ### Changed
 - `list_sessions` compact shape now includes `"status"` field.
 - `list_sessions` full shape now includes `"status"` and `"status_detail"`.
-- `peer_stall_watcher`: rewritten as an immediate idle notifier. Subscribes
-  to `status_changed` and fires instantly when a session transitions to an
-  idle state — no timer, no threshold, no local state cache. Duplicate
-  notifications are prevented by the server-side `before != after` guarantee
-  on `update_session_status`. Env vars renamed to `PEER_IDLE_*`.
+- `peer_idle_notifier` (formerly `peer_stall_watcher`): an immediate idle
+  notifier. Subscribes to `status_changed` and fires instantly when a session
+  transitions to an idle state — no timer, no threshold, no local state cache.
+  Duplicate notifications are prevented by the server-side `before != after`
+  guarantee on `update_session_status`. Env vars use the `PEER_IDLE_*` prefix.
 - `plugins/github_pr_watcher`: manual `on_broker_message` dispatch replaced
   with `@command` + `sender` parameter.
 

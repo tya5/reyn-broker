@@ -450,7 +450,7 @@ post_message(to="github-ci", from_session="me", message="list")
 
 複数セッションが同じ PR を watch した場合、全員に通知が届きます。
 
-### `peer_stall_watcher.py` — Peer Idle 検出
+### `peer_idle_notifier.py` — Peer Idle 検出
 
 セッションが `update_session_status(..., status="idle")` を呼んだ瞬間に即通知します。ポーリング・タイマー不要。`status_changed` の before != after 保証により重複通知なし。
 
@@ -458,9 +458,9 @@ post_message(to="github-ci", from_session="me", message="list")
 
 ```python
 add_plugin(
-    name="peer-stall-watcher",
-    command="/path/to/.venv/bin/reyn-broker-peer-stall",
-    session_id="peer-stall-watcher",
+    name="peer-idle-notifier",
+    command="/path/to/.venv/bin/reyn-broker-peer-idle",
+    session_id="peer-idle-notifier",
     auto_start=True,
 )
 ```
