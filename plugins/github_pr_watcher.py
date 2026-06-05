@@ -31,9 +31,22 @@ pr_closed: #N 「title」 owner/repo
 pr_clean: #N PREV→CLEAN owner/repo
 pr_dirty: #N CLEAN→NEXT owner/repo
 
+Polling cadence
+---------------
+The watcher adapts its poll interval to PR activity. While any watched PR is
+mid-flight (mergeStateStatus in a pre-CLEAN transient state — BLOCKED/UNKNOWN
+by default), it polls at the *fast* interval so the short-lived BLOCKED→CLEAN
+edge is observed before the PR is merged away. When everything has settled, it
+drops back to the *slow* idle interval. This closes the discrete-sampling miss
+where a PR went BLOCKED→CLEAN→merged inside one slow poll interval and the
+open+CLEAN state was never sampled (so pr_clean was skipped).
+
 Environment variables
 ---------------------
-PR_WATCH_INTERVAL   Poll interval in seconds (default: 300)
+PR_WATCH_INTERVAL        Idle poll interval in seconds (default: 300)
+PR_WATCH_FAST_INTERVAL   Poll interval while a PR is mid-flight (default: 25)
+PR_WATCH_FAST_STATES     Comma-separated mergeStateStatus values treated as
+                         mid-flight (default: BLOCKED,UNKNOWN)
 """
 from __future__ import annotations
 
@@ -50,6 +63,12 @@ from plugin_base import BrokerClient, BrokerPlugin, command
 logger = logging.getLogger("broker.plugin.github_pr_watcher")
 
 _PR_POLL_S = int(os.environ.get("PR_WATCH_INTERVAL", "300"))
+_PR_FAST_S = int(os.environ.get("PR_WATCH_FAST_INTERVAL", "25"))
+_FAST_STATES = frozenset(
+    s.strip().upper()
+    for s in os.environ.get("PR_WATCH_FAST_STATES", "BLOCKED,UNKNOWN").split(",")
+    if s.strip()
+)
 
 
 @dataclass
@@ -123,7 +142,7 @@ class GitHubPRWatcher(BrokerPlugin):
                 self._watched[repo] = WatchedRepo(repo=repo, known_prs=initial)
             if sender:
                 self._watched[repo].subscribers.add(sender)
-            broker.start_poll(_PR_POLL_S)
+            broker.start_poll(self._next_interval_locked())
         pr_count = len(initial)
         logger.info("watch: %s by %s (snapshot: %d open PRs)", repo, sender, pr_count)
         return f"watching {repo} — {pr_count} open PRs snapshotted, poll every {_PR_POLL_S}s"
@@ -148,6 +167,22 @@ class GitHubPRWatcher(BrokerPlugin):
             for repo, w in self._watched.items():
                 lines.append(f"{repo}: {sorted(w.subscribers)} ({len(w.known_prs)} open PRs)")
             return "\n".join(lines)
+
+    def _next_interval_locked(self) -> float:
+        """Pick the next poll cadence based on PR activity.
+
+        Returns the fast interval while any watched PR sits in a pre-CLEAN
+        transient state (CI running / mergeability still computing), so the
+        short-lived BLOCKED→CLEAN edge is sampled before the PR merges away.
+        Falls back to the slow idle interval once everything has settled.
+
+        Caller MUST hold ``self._lock``.
+        """
+        for w in self._watched.values():
+            for pr in w.known_prs.values():
+                if pr.merge_state in _FAST_STATES:
+                    return _PR_FAST_S
+        return _PR_POLL_S
 
     async def on_poll(self, broker: BrokerClient) -> None:
         async with self._lock:
@@ -205,6 +240,10 @@ class GitHubPRWatcher(BrokerPlugin):
                 logger.info("%s → %s", event, subscribers)
                 for sub in subscribers:
                     await broker.post(to=sub, message=event)
+
+        # Adapt cadence: speed up while any PR is mid-flight, idle otherwise.
+        async with self._lock:
+            broker.start_poll(self._next_interval_locked())
 
 
 def main() -> None:

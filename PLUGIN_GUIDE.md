@@ -553,6 +553,14 @@ post_message(to="github-pr-watcher", from_session="me", message="unwatch:tya5/re
 post_message(to="github-pr-watcher", from_session="me", message="list")
 ```
 
+ポーリング間隔は PR の活性度に応じて自動で変わります。監視中の PR のどれかが
+mid-flight（`mergeStateStatus` が `PR_WATCH_FAST_STATES`、既定 `BLOCKED,UNKNOWN`）
+の間は fast 間隔（`PR_WATCH_FAST_INTERVAL`、既定 25s）で巡回し、全 PR が落ち着くと
+idle 間隔（`PR_WATCH_INTERVAL`、既定 300s）に戻ります。これは BLOCKED→CLEAN→merged
+が 1 巡回内に起きて `pr_clean` を取りこぼす問題（離散サンプリングの限界）を緩和する
+ためのもので、取りこぼし窓を 300s → ~25s に縮めます（ゼロにはなりません）。
+受信側は `pr_merged` を `pr_clean` の終端上位シグナルとして扱うのが安全です。
+
 ---
 
 ## 設計原則

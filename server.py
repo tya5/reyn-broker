@@ -29,7 +29,7 @@ from mcp.server.session import ServerSession
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.15.2"
+_VERSION = "0.15.3"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.

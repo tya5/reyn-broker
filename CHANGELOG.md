@@ -2,6 +2,27 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.15.3] - 2026-06-05
+
+### Fixed
+- **github-pr-watcher missed `pr_clean` when a PR went BLOCKED→CLEAN→merged
+  inside one poll interval.** `pr_clean` is an edge derived by sampling each
+  open PR's `mergeStateStatus` every 300 s. When CI completed and the PR was
+  merged (manually or by auto/force-merge) faster than the poll interval, no
+  poll ever observed the PR in the open+CLEAN state — it jumped straight from
+  BLOCKED to gone, producing `pr_merged` and skipping `pr_clean`. This hit the
+  force-merge wave hardest (#1318, #1302), where the CLEAN-open window collapses
+  to near-zero. Fix: the watcher now **adapts its poll cadence** — it polls at a
+  fast interval (`PR_WATCH_FAST_INTERVAL`, default 25 s) while any watched PR is
+  mid-flight (`mergeStateStatus` in `PR_WATCH_FAST_STATES`, default
+  `BLOCKED,UNKNOWN`) and drops back to the idle interval (`PR_WATCH_INTERVAL`,
+  default 300 s) once all PRs settle. Single poll loop, single emitter — the
+  existing diff logic is unchanged, so there are no concurrency races. This
+  narrows the miss window from 300 s to ~25 s; it does not eliminate it (a true
+  zero-miss fix needs GitHub webhooks). Recipients should still treat
+  `pr_merged` as the terminal signal that supersedes a possibly-missed
+  `pr_clean`.
+
 ## [0.15.2] - 2026-06-04
 
 ### Fixed
