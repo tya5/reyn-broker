@@ -2,6 +2,30 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.15.4] - 2026-06-13
+
+### Fixed
+- **ci-watcher never relayed any CI results (`last_post_at=null`).** The plugin
+  was a per-PR opt-in model (`watch:#N`) but no session was issuing watch
+  commands, so it polled nothing and posted nothing. Additionally, the `watch`
+  and `unwatch` handlers stored `broker._session_id` (the plugin's own session
+  id, always `"ci-watcher"`) as the requester instead of the caller's id, meaning
+  even if someone did subscribe, notifications would post back to the plugin
+  itself rather than the caller.
+
+### Added
+- **`watch-repo:owner/repo` / `unwatch-repo:owner/repo` commands** for
+  repo-level CI subscription. Subscribing to a repo causes ci-watcher to poll
+  all open PRs in that repo every `CI_POLL_S` seconds (default 60) and relay
+  `ci_result: #N success|failure owner/repo` events to all subscribers when a
+  PR's CI reaches a terminal state. This fills the gap where a PR sits in
+  BLOCKED state, CI fails, but no `mergeStateStatus` transition occurs so
+  github-pr-watcher emits nothing. After subscribing, backlog-watcher no longer
+  needs to self-poll GitHub CI — the plugin boundary violation is resolved.
+- **Fixed `sender` in `watch`/`unwatch`** — per-PR commands now correctly track
+  the requesting session id via the `sender` parameter rather than the plugin's
+  own id.
+
 ## [0.15.3] - 2026-06-05
 
 ### Fixed

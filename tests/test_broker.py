@@ -979,7 +979,7 @@ async def test_session_ttl_expires_and_removed(broker_url: str) -> None:
 async def test_health_check_returns_expected_fields(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.15.3"
+    assert result["version"] == "0.15.4"
     assert isinstance(result["uptime_seconds"], int)
     assert result["uptime_seconds"] >= 0
     assert result["started_at_iso"].startswith("20")
@@ -1295,7 +1295,7 @@ async def test_restart_plugin(broker_url: str) -> None:
 async def test_health_check_version_updated(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.15.3"
+    assert result["version"] == "0.15.4"
 
 
 # ---------------------------------------------------------------------------
