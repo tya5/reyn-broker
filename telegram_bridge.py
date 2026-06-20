@@ -407,6 +407,7 @@ async def broker_loop(cs: ClientSession) -> None:
             raise
         except Exception as exc:
             print(f"[telegram-bridge] broker poll error: {exc}", file=sys.stderr)
+            raise
 
 
 async def main() -> None:
@@ -439,10 +440,9 @@ async def main() -> None:
                 state: dict = {}
                 # Show session picker immediately on startup
                 await show_home(cs, state)
-                await asyncio.gather(
-                    telegram_loop(cs, state),
-                    broker_loop(cs),
-                )
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(telegram_loop(cs, state))
+                    tg.create_task(broker_loop(cs))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
