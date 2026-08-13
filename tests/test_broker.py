@@ -13,25 +13,52 @@ from mcp.client.streamable_http import streamable_http_client
 from pydantic import AnyUrl
 
 
+def _uri(text: str) -> Any:
+    """Return a resource URI in the form the installed SDK accepts.
+
+    mcp 1.x validates these params as ``AnyUrl``; 2.0 validates them as
+    ``str`` and rejects an ``AnyUrl`` outright. Passing the wrong one is a
+    pydantic ValidationError at call time, so pick per version.
+    """
+    from mcp.types import ReadResourceRequestParams
+
+    field = ReadResourceRequestParams.model_fields["uri"]
+    return text if field.annotation is str else AnyUrl(text)
+
+
+@asynccontextmanager
+async def _transport(url: str):
+    """Yield ``(read, write)`` from the client transport.
+
+    mcp 1.x yields a third element (a session-id callback); 2.0 yields two.
+    Unpacking a fixed arity fails on whichever version you did not write
+    for, so take the first two and ignore the rest.
+    """
+    async with streamable_http_client(url) as streams:
+        yield streams[0], streams[1]
+
+
 @asynccontextmanager
 async def _client(url: str):
-    async with (
-        streamable_http_client(url) as (read, write, _close),
-        ClientSession(read, write) as session,
-    ):
-        await session.initialize()
-        yield session
+    async with _transport(url) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
 
 
 def _payload(result: Any) -> Any:
     """Extract the structured payload from a CallToolResult.
 
-    FastMCP returns results via ``structuredContent={"result": ...}`` when
-    available. Falls back to JSON-decoding each TextContent block.
+    The field carrying it is spelled ``structuredContent`` on mcp 1.x and
+    ``structured_content`` on 2.0. Reading only one of them yields None on
+    the other version and silently falls through to the text blocks —
+    which on 2.0 are empty, so callers get an empty result rather than an
+    error. Check both.
     """
-    structured = getattr(result, "structuredContent", None)
-    if isinstance(structured, dict) and "result" in structured:
-        return structured["result"]
+    for attr in ("structured_content", "structuredContent"):
+        structured = getattr(result, attr, None)
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
     items = []
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
@@ -1501,18 +1528,23 @@ async def _subscriber_client(url: str, updates: list[str]):
     """Client that records resources/updated URIs into ``updates``."""
 
     async def _on_message(msg: Any) -> None:
-        root = getattr(msg, "root", None)
-        params = getattr(root, "params", None)
-        uri = getattr(params, "uri", None)
-        if uri is not None and type(root).__name__ == "ResourceUpdatedNotification":
+        # 1.x wraps notifications in a ServerNotification union (.root);
+        # 2.0 hands the notification over directly. Unwrap if wrapped, then
+        # match on the concrete type either way — keying off .root alone
+        # silently records nothing on 2.0.
+        note = getattr(msg, "root", msg)
+        if type(note).__name__ != "ResourceUpdatedNotification":
+            return
+        uri = getattr(getattr(note, "params", None), "uri", None)
+        if uri is not None:
             updates.append(str(uri))
 
-    async with (
-        streamable_http_client(url) as (read, write, _close),
-        ClientSession(read, write, message_handler=_on_message) as session,
-    ):
-        await session.initialize()
-        yield session
+    async with _transport(url) as (read, write):
+        async with ClientSession(
+            read, write, message_handler=_on_message
+        ) as session:
+            await session.initialize()
+            yield session
 
 
 async def _await_updates(updates: list[str], *, minimum: int = 1) -> None:
@@ -1532,11 +1564,9 @@ async def test_resources_subscribe_capability_is_advertised(broker_url: str) -> 
     ``_advertise_resource_subscribe``. Without the advertisement a client
     that trusts it will never subscribe at all.
     """
-    async with (
-        streamable_http_client(broker_url) as (read, write, _close),
-        ClientSession(read, write) as session,
-    ):
-        init = await session.initialize()
+    async with _transport(broker_url) as (read, write):
+        async with ClientSession(read, write) as session:
+            init = await session.initialize()
     assert init.capabilities.resources is not None
     assert init.capabilities.resources.subscribe is True
 
@@ -1552,7 +1582,7 @@ async def test_inbox_read_does_not_drain(broker_url: str) -> None:
     message, and only a missed wake-up loses it.
     """
     sid = "res-nondestructive"
-    uri = AnyUrl(f"broker://inbox/{sid}")
+    uri = _uri(f"broker://inbox/{sid}")
     async with _client(broker_url) as c:
         await c.call_tool(
             "post_message", {"to": sid, "from_session": "sender", "message": "keep-me"}
@@ -1581,7 +1611,7 @@ async def test_inbox_updated_notification_is_per_session(broker_url: str) -> Non
     """
     updates: list[str] = []
     async with _subscriber_client(broker_url, updates) as sub:
-        await sub.subscribe_resource(AnyUrl("broker://inbox/alpha"))
+        await sub.subscribe_resource(_uri("broker://inbox/alpha"))
 
         async with _client(broker_url) as poster:
             await poster.call_tool(
@@ -1608,11 +1638,11 @@ async def test_inbox_subscription_survives_reconnect(broker_url: str) -> None:
     sid = "reconnector"
     updates_first: list[str] = []
     async with _subscriber_client(broker_url, updates_first) as sub:
-        await sub.subscribe_resource(AnyUrl(f"broker://inbox/{sid}"))
+        await sub.subscribe_resource(_uri(f"broker://inbox/{sid}"))
 
     updates_second: list[str] = []
     async with _subscriber_client(broker_url, updates_second) as sub:
-        await sub.subscribe_resource(AnyUrl(f"broker://inbox/{sid}"))
+        await sub.subscribe_resource(_uri(f"broker://inbox/{sid}"))
         async with _client(broker_url) as poster:
             await poster.call_tool(
                 "post_message", {"to": sid, "from_session": "s", "message": "after reconnect"}
