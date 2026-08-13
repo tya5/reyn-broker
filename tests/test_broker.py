@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from pydantic import AnyUrl
 
 
 @asynccontextmanager
@@ -1487,3 +1489,134 @@ async def test_unregister_drops_subscriptions_and_commands(broker_url: str) -> N
         await c.call_tool("register_session", {"session_id": "mover", "working_dir": "/tmp/m"})
         await c.call_tool("post_message", {"to": "x", "from_session": "mover", "message": "hi"})
         assert _payload(await c.call_tool("receive_messages", {"session_id": "ghost"})) == []
+
+
+# ---------------------------------------------------------------------------
+# Inbox resources (reyn-broker#13)
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _subscriber_client(url: str, updates: list[str]):
+    """Client that records resources/updated URIs into ``updates``."""
+
+    async def _on_message(msg: Any) -> None:
+        root = getattr(msg, "root", None)
+        params = getattr(root, "params", None)
+        uri = getattr(params, "uri", None)
+        if uri is not None and type(root).__name__ == "ResourceUpdatedNotification":
+            updates.append(str(uri))
+
+    async with (
+        streamable_http_client(url) as (read, write, _close),
+        ClientSession(read, write, message_handler=_on_message) as session,
+    ):
+        await session.initialize()
+        yield session
+
+
+async def _await_updates(updates: list[str], *, minimum: int = 1) -> None:
+    """Give notifications a moment to arrive (they are pushed, not polled)."""
+    for _ in range(50):
+        if len(updates) >= minimum:
+            return
+        await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_resources_subscribe_capability_is_advertised(broker_url: str) -> None:
+    """The exact field reyn refuses to connect without.
+
+    The SDK hardcodes ``subscribe=False`` on mcp 1.x and registering a
+    subscribe handler does not change it, so this is set explicitly by
+    ``_advertise_resource_subscribe``. Without the advertisement a client
+    that trusts it will never subscribe at all.
+    """
+    async with (
+        streamable_http_client(broker_url) as (read, write, _close),
+        ClientSession(read, write) as session,
+    ):
+        init = await session.initialize()
+    assert init.capabilities.resources is not None
+    assert init.capabilities.resources.subscribe is True
+
+
+@pytest.mark.asyncio
+async def test_inbox_read_does_not_drain(broker_url: str) -> None:
+    """Reading the resource must leave the mail for receive_messages.
+
+    This is the property that makes a dropped notification survivable: a
+    client that misses the wake-up still finds the message on the next
+    read. If a future change made reads destructive the failure would be
+    silent — the notification still fires, the first reader still sees the
+    message, and only a missed wake-up loses it.
+    """
+    sid = "res-nondestructive"
+    uri = AnyUrl(f"broker://inbox/{sid}")
+    async with _client(broker_url) as c:
+        await c.call_tool(
+            "post_message", {"to": sid, "from_session": "sender", "message": "keep-me"}
+        )
+
+        first = json.loads((await c.read_resource(uri)).contents[0].text)
+        assert first["pending_count"] == 1
+        assert first["messages"][0]["message"] == "keep-me"
+
+        second = json.loads((await c.read_resource(uri)).contents[0].text)
+        assert second["pending_count"] == 1, "re-read lost the message"
+
+        drained = _payload(await c.call_tool("receive_messages", {"session_id": sid}))
+        assert [m["message"] for m in drained] == ["keep-me"], "read consumed the mail"
+
+        after = json.loads((await c.read_resource(uri)).contents[0].text)
+        assert after["pending_count"] == 0, "receive_messages must still drain"
+
+
+@pytest.mark.asyncio
+async def test_inbox_updated_notification_is_per_session(broker_url: str) -> None:
+    """One resource per session — a subscriber is woken only by its own mail.
+
+    Pins the choice against collapsing back to a single shared feed, which
+    would wake every peer on every message.
+    """
+    updates: list[str] = []
+    async with _subscriber_client(broker_url, updates) as sub:
+        await sub.subscribe_resource(AnyUrl("broker://inbox/alpha"))
+
+        async with _client(broker_url) as poster:
+            await poster.call_tool(
+                "post_message", {"to": "beta", "from_session": "s", "message": "not yours"}
+            )
+            await asyncio.sleep(0.5)
+            assert updates == [], "woken by another session's mail"
+
+            await poster.call_tool(
+                "post_message", {"to": "alpha", "from_session": "s", "message": "yours"}
+            )
+            await _await_updates(updates)
+
+    assert updates == ["broker://inbox/alpha"]
+
+
+@pytest.mark.asyncio
+async def test_inbox_subscription_survives_reconnect(broker_url: str) -> None:
+    """A fresh connection can re-subscribe and still be woken.
+
+    Subscriptions belong to a connection and are not persisted, so this is
+    what a client does after a broker restart: subscribe again, read again.
+    """
+    sid = "reconnector"
+    updates_first: list[str] = []
+    async with _subscriber_client(broker_url, updates_first) as sub:
+        await sub.subscribe_resource(AnyUrl(f"broker://inbox/{sid}"))
+
+    updates_second: list[str] = []
+    async with _subscriber_client(broker_url, updates_second) as sub:
+        await sub.subscribe_resource(AnyUrl(f"broker://inbox/{sid}"))
+        async with _client(broker_url) as poster:
+            await poster.call_tool(
+                "post_message", {"to": sid, "from_session": "s", "message": "after reconnect"}
+            )
+        await _await_updates(updates_second)
+
+    assert updates_second == [f"broker://inbox/{sid}"]
