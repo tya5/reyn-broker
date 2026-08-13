@@ -2,6 +2,42 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Runs on both mcp 1.x and 2.0** (#16). The SDK's 2.0 release renames or
+  moves most of what the server touches, and the pieces fail at different
+  times: the import fails immediately, the private lowlevel-server handle
+  fails at startup, and `settings.host`/`settings.port` fail *silently* —
+  2.0 dropped those fields, so assigning to them creates an attribute
+  nobody reads and the server comes up on the default port looking
+  healthy. Each is now version-aware:
+
+  | | mcp 1.x | mcp 2.0 |
+  |---|---|---|
+  | module | `mcp.server.fastmcp` | `mcp.server.mcpserver` |
+  | class | `FastMCP` | `MCPServer` |
+  | lowlevel handle | `_mcp_server` | `_lowlevel_server` |
+  | subscribe handler | `@server.subscribe_resource()` | `Server(...)` kwargs / `_request_handlers` |
+  | bind address | `settings.host` / `.port` | `run()` kwargs |
+
+  `resources/subscribe` is kept rather than replaced: every peer's watcher
+  is a pre-2026-07-28 client today, and mcp 2.0 still routes the method for
+  exactly that reason. Newer clients use `subscriptions/listen`, which the
+  2.0 SDK serves on its own — nothing to implement here.
+
+  Verified on both SDKs: 80 tests pass under each, and a live 1.x client
+  against the 2.0 server negotiates 2025-11-25, subscribes, is woken,
+  reads non-destructively, drains, and sees all 24 tools.
+
+### Fixed
+- **Test harness reads the same result twice.** `structuredContent` (1.x)
+  and `structured_content` (2.0) are the same field; checking only one
+  returned an empty result on the other version instead of an error.
+  Same for the notification union (`.root` on 1.x, bare on 2.0) — reading
+  only one shape recorded no wake-ups at all on the other, which looks
+  like a delivery bug rather than a harness bug.
+
 ## [0.16.0] - 2026-08-13
 
 ### Added
