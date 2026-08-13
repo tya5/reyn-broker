@@ -144,7 +144,11 @@ async def test_post_to_offline_recipient_queues(broker_url: str) -> None:
         )
     text = result.content[0].text
     assert "bob" in text
-    assert "False" in text  # online=False since bob hasn't registered
+    # bob has never registered, so the reply must say that rather than
+    # "online=False" — an unknown id and an idle peer used to be reported
+    # identically, which is what reyn-broker#14 fixed. The message is still
+    # queued either way (asserted by the pending-drain test below).
+    assert "NOT REGISTERED" in text
 
 
 @pytest.mark.asyncio
@@ -623,13 +627,22 @@ async def test_post_message_single_recipient_backward_compat(broker_url: str) ->
     """recipients=None → original to= behaviour preserved."""
     async with _client(broker_url) as a:
         await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
-        result = await a.call_tool(
-            "post_message",
-            {"to": "bob", "from_session": "alice", "message": "hi"},
-        )
+        # bob is registered so the reply exercises the online= form; an
+        # unregistered target takes the reyn-broker#14 branch instead, which
+        # would make this assert about recipient existence rather than about
+        # the single- vs multi-recipient reply format it is here to pin.
+        async with _client(broker_url) as b:
+            await b.call_tool(
+                "register_session", {"session_id": "bob", "working_dir": "/tmp/b"}
+            )
+            result = await a.call_tool(
+                "post_message",
+                {"to": "bob", "from_session": "alice", "message": "hi"},
+            )
     text = result.content[0].text
     assert "bob" in text
     assert "online=" in text  # original single-recipient format
+    assert "recipients" not in text  # not the aggregated multi-recipient form
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +992,7 @@ async def test_session_ttl_expires_and_removed(broker_url: str) -> None:
 async def test_health_check_returns_expected_fields(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.15.4"
+    assert result["version"] == "0.16.0"
     assert isinstance(result["uptime_seconds"], int)
     assert result["uptime_seconds"] >= 0
     assert result["started_at_iso"].startswith("20")
@@ -1295,7 +1308,7 @@ async def test_restart_plugin(broker_url: str) -> None:
 async def test_health_check_version_updated(broker_url: str) -> None:
     async with _client(broker_url) as c:
         result = _payload(await c.call_tool("health_check", {}))
-    assert result["version"] == "0.15.4"
+    assert result["version"] == "0.16.0"
 
 
 # ---------------------------------------------------------------------------
