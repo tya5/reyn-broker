@@ -1614,18 +1614,20 @@ async def test_inbox_updated_notification_is_per_session(broker_url: str) -> Non
         await sub.subscribe_resource(_uri("broker://inbox/alpha"))
 
         async with _client(broker_url) as poster:
+            # Post to someone else first, then to us. Waiting a while after
+            # the first post and asserting "still nothing" would only say
+            # nothing arrived *yet* — a longer sleep makes it no truer.
+            # Ordering does: once our own wake-up lands, the other one has
+            # had its chance and demonstrably did not come.
             await poster.call_tool(
                 "post_message", {"to": "beta", "from_session": "s", "message": "not yours"}
             )
-            await asyncio.sleep(0.5)
-            assert updates == [], "woken by another session's mail"
-
             await poster.call_tool(
                 "post_message", {"to": "alpha", "from_session": "s", "message": "yours"}
             )
             await _await_updates(updates)
 
-    assert updates == ["broker://inbox/alpha"]
+    assert updates == ["broker://inbox/alpha"], "woken by another session's mail"
 
 
 @pytest.mark.asyncio
