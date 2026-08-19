@@ -1632,6 +1632,30 @@ async def list_plugins() -> list[dict[str, Any]]:
     ]
 
 
+def _apply_bind_address(host: str, port: int) -> dict[str, Any]:
+    """Route the requested bind address to wherever the installed SDK reads it.
+
+    Returns the kwargs to pass to ``mcp.run()``; on mcp 1.x the address
+    travels through ``mcp.settings`` instead and the returned mapping is
+    empty.
+
+    Split out of ``main()`` so the ``BROKER_HOST``/``BROKER_PORT`` knobs
+    can be tested end to end.
+
+    The ``hasattr`` guard is load-bearing rather than defensive: on 2.0 a
+    ``settings`` object still exists, but it has no ``host`` field and
+    pydantic rejects the assignment outright (``ValueError: "Settings"
+    object has no field "host"``). Testing only for ``settings is not
+    None`` therefore takes down startup on 2.0.
+    """
+    settings = getattr(mcp, "settings", None)
+    if settings is not None and hasattr(settings, "host"):  # mcp 1.x
+        settings.host = host
+        settings.port = port
+        return {}
+    return {"host": host, "port": port}  # mcp 2.0+
+
+
 def main() -> None:
     import argparse
 
@@ -1663,18 +1687,10 @@ def main() -> None:
     )
     # Where the bind address lives moved between SDK versions: 1.x reads it
     # off ``settings``, 2.0 dropped those fields and takes host/port as
-    # run() kwargs. Passing them to a 1.x run() is not accepted, and
-    # assigning to settings on 2.0 silently creates an attribute nobody
-    # reads — the server would come up on the default port instead of the
-    # one asked for, which looks like "started fine" until nothing can
-    # reach it. So branch on which one the installed SDK actually has.
-    run_kwargs: dict[str, Any] = {}
-    settings = getattr(mcp, "settings", None)
-    if settings is not None and hasattr(settings, "host"):  # mcp 1.x
-        settings.host = args.host
-        settings.port = args.port
-    else:  # mcp 2.0+
-        run_kwargs = {"host": args.host, "port": args.port}
+    # run() kwargs. Passing them to a 1.x run() is not accepted, and 2.0
+    # keeps a settings object without those fields, so assigning to them
+    # raises. So branch on which one the installed SDK actually has.
+    run_kwargs = _apply_bind_address(args.host, args.port)
 
     logger.info(
         "starting broker on %s:%s (state file: %s)",
