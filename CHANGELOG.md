@@ -27,11 +27,14 @@ All notable changes to reyn-broker are documented in this file.
   `session_watcher.py` under *this* repo's venv, so they speak whatever
   version the broker pins. mcp 2.0 still routes the method for exactly
   this case. Newer clients use `subscriptions/listen`, which the 2.0 SDK
-  serves on its own — nothing to implement here.
+  serves on its own — so the *method* needs nothing here, but the events
+  still do: they reach a listen stream only if the server publishes them
+  on the subscription bus, which `_publish_inbox_event()` does.
 
-  Verified on both SDKs: 80 tests pass under each, and a live 1.x client
-  against the 2.0 server negotiates 2025-11-25, subscribes, is woken,
-  reads non-destructively, drains, and sees all 24 tools.
+  Verified on both SDKs: the suite passes under each (the listen-bus test
+  is skipped on 1.x, which has no bus), and a live 1.x client against the
+  2.0 server negotiates 2025-11-25, subscribes, is woken, reads
+  non-destructively, drains, and sees all 24 tools.
 
 ### Fixed
 - **Test harness reads the same result twice.** `structuredContent` (1.x)
