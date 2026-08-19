@@ -8,10 +8,10 @@ All notable changes to reyn-broker are documented in this file.
 - **Runs on both mcp 1.x and 2.0** (#16). The SDK's 2.0 release renames or
   moves most of what the server touches, and the pieces fail at different
   times: the import fails immediately, the private lowlevel-server handle
-  fails at startup, and `settings.host`/`settings.port` fail *silently* —
-  2.0 dropped those fields, so assigning to them creates an attribute
-  nobody reads and the server comes up on the default port looking
-  healthy. Each is now version-aware:
+  fails at startup, and `settings.host`/`settings.port` fail once the bind
+  address is applied — 2.0 keeps a `settings` object but drops those
+  fields, and pydantic rejects the assignment (`ValueError: "Settings"
+  object has no field "host"`). Each is now version-aware:
 
   | | mcp 1.x | mcp 2.0 |
   |---|---|---|

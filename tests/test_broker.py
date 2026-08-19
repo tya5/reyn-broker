@@ -1691,3 +1691,29 @@ async def test_inbox_event_reaches_the_listen_bus_with_no_legacy_subscriber() ->
         server.mcp._subscriptions = original
 
     assert [getattr(e, "uri", None) for e in published] == [f"broker://inbox/{sid}"]
+
+
+def test_bind_address_knob_reaches_the_sdk() -> None:
+    """BROKER_HOST/BROKER_PORT must actually change where the server binds.
+
+    The knob travels two hops (env -> argparse default -> SDK), and the
+    SDK-facing hop is version-specific: 1.x reads ``mcp.settings``, 2.0
+    takes run() kwargs. 2.0 still has a ``settings`` object, so a
+    ``settings is not None`` test picks the 1.x path and then dies on
+    ``ValueError: "Settings" object has no field "host"`` — startup, not
+    just the knob.
+
+    Asserts the value is observable wherever this SDK actually reads it,
+    rather than that the assignment happened.
+    """
+    import server
+
+    host, port = "10.1.2.3", 19999
+    run_kwargs = server._apply_bind_address(host, port)
+
+    settings = getattr(server.mcp, "settings", None)
+    if settings is not None and hasattr(settings, "host"):  # mcp 1.x
+        assert (settings.host, settings.port) == (host, port)
+        assert run_kwargs == {}
+    else:  # mcp 2.0+
+        assert run_kwargs == {"host": host, "port": port}
