@@ -60,8 +60,16 @@ All notable changes to reyn-broker are documented in this file.
   Note for future SDK bumps: on mcp 1.x the `resources.subscribe` capability
   had to be set explicitly — `Server.get_capabilities` hardcodes
   `subscribe=False` and registering a subscribe handler does not change that.
-  mcp 2.0 derives the flag from handler registration instead, at which point
-  `_advertise_resource_subscribe()` becomes redundant and can be dropped.
+  mcp 2.0 derives the flag, but which input it derives from depends on the
+  negotiated protocol version: below 2026-07-28 it reads the registered
+  `resources/subscribe` handler (so the wrapper is a no-op), and at 2026-07-28+
+  it reads `subscriptions/listen` and ignores the old handler entirely —
+  the SDK's own wording is that the modern wire "cannot dispatch" it.
+
+  So dropping `_advertise_resource_subscribe()` is not the whole retirement:
+  once peers negotiate 2026-07-28, `resources/subscribe` stops being reachable,
+  not merely unadvertised. #20 tracks that, and its condition is a measurement
+  of what live watchers negotiate — not of what their SDK version pins allow.
 
 ### Fixed
 - **`post_message` to an unregistered recipient now says so** (#14).
