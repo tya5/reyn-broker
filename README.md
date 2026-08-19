@@ -137,10 +137,11 @@ Two properties worth knowing:
 - **One resource per session, not one shared feed.** A subscriber is woken
   only by its own mail; a single global URI would wake every peer on every
   message.
-- **Reading is non-destructive.** Only `receive_messages` drains. A missed
-  notification is therefore not a lost message — the mail is still there on
-  the next read, which makes wake-ups at-least-once rather than
-  exactly-once.
+- **Reading is non-destructive.** A missed notification is therefore not a
+  lost message — the mail is still there on the next read, which makes
+  wake-ups at-least-once rather than exactly-once. Reading removes
+  nothing; `receive_messages` drains, and the TTL sweep also drops
+  messages that were posted with `ttl_seconds` once they expire.
 
 Subscriptions live in memory and belong to a connection: after a broker
 restart, clients re-subscribe and re-read to catch up.
