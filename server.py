@@ -344,11 +344,17 @@ def _register_resource_subscription_handlers() -> None:
     without them a subscribe request is answered with "method not found"
     even though we advertise the capability.
 
-    ``resources/subscribe`` is how pre-2026-07-28 clients ask to be woken.
-    Every peer's watcher is one of those today, so this stays for as long
-    as any of them do — mcp 2.0 still routes the method for exactly that
-    reason, and serves ``subscriptions/listen`` alongside it for newer
-    clients (which we do not have to implement: the SDK does it).
+    ``resources/subscribe`` is how pre-2026-07-28 clients ask to be woken,
+    and every live watcher is one of those today — measured, not assumed:
+    all 7 run ``session_watcher.py`` under *this* repo's venv, so they
+    speak whatever mcp version the broker pins, regardless of what the
+    peer's own venv holds (several peers are already on 2.0). Upgrading
+    the pin therefore moves every watcher at once, which is also why this
+    handler cannot be dropped on the strength of "the peers are modern".
+
+    mcp 2.0 still routes the method for exactly this reason, and serves
+    ``subscriptions/listen`` alongside it for newer clients (which we do
+    not have to implement: the SDK does it).
 
     The two SDKs register handlers differently, and neither exposes a
     public way to do it after construction:
@@ -1133,10 +1139,17 @@ async def inbox_resource(session_id: str) -> str:
     peer on every message.
 
     Deliberately non-destructive: reading is what a woken client does
-    *before* it decides to act, and ``receive_messages`` remains the only
-    thing that removes messages. If a client misses an ``updated``
-    notification the messages are still here, so wake-ups are
+    *before* it decides to act, so a client that misses an ``updated``
+    notification still finds the message here — wake-ups are
     at-least-once rather than exactly-once.
+
+    Reading never removes anything. Two things do: ``receive_messages``
+    (the intended drain) and the TTL sweep in ``_background_purge``,
+    which drops messages posted with ``ttl_seconds`` once they expire.
+    The sweep is opt-in per message, so an inbox of ordinary messages is
+    only emptied by its owner — but "only receive_messages drains" would
+    be false, and a subscriber relying on it could lose expiring mail
+    between the wake-up and the read.
     """
     _tool_call_counts["inbox_resource"] += 1
     async with registry_lock:

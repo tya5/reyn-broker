@@ -21,10 +21,13 @@ All notable changes to reyn-broker are documented in this file.
   | subscribe handler | `@server.subscribe_resource()` | `Server(...)` kwargs / `_request_handlers` |
   | bind address | `settings.host` / `.port` | `run()` kwargs |
 
-  `resources/subscribe` is kept rather than replaced: every peer's watcher
-  is a pre-2026-07-28 client today, and mcp 2.0 still routes the method for
-  exactly that reason. Newer clients use `subscriptions/listen`, which the
-  2.0 SDK serves on its own — nothing to implement here.
+  `resources/subscribe` is kept rather than replaced. All 7 live watchers
+  are pre-2026-07-28 clients — not because the peers are on old SDKs
+  (several are already on 2.0) but because every watcher runs
+  `session_watcher.py` under *this* repo's venv, so they speak whatever
+  version the broker pins. mcp 2.0 still routes the method for exactly
+  this case. Newer clients use `subscriptions/listen`, which the 2.0 SDK
+  serves on its own — nothing to implement here.
 
   Verified on both SDKs: 80 tests pass under each, and a live 1.x client
   against the 2.0 server negotiates 2025-11-25, subscribes, is woken,
@@ -48,10 +51,11 @@ All notable changes to reyn-broker are documented in this file.
   One resource per session rather than a single shared feed — a subscriber is
   woken only by its own mail.
 
-  Reading the resource is **non-destructive**: it never removes messages, and
-  `receive_messages` remains the only thing that drains. A client that misses
-  a notification still finds the message waiting, so wake-ups are
-  at-least-once rather than exactly-once.
+  Reading the resource is **non-destructive**: it never removes messages, so
+  a client that misses a notification still finds the message waiting and
+  wake-ups are at-least-once rather than exactly-once. Draining is done by
+  `receive_messages`; separately, the TTL sweep drops messages posted with
+  `ttl_seconds` once they expire.
 
   Note for future SDK bumps: on mcp 1.x the `resources.subscribe` capability
   had to be set explicitly — `Server.get_capabilities` hardcodes
