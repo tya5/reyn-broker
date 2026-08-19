@@ -1652,3 +1652,42 @@ async def test_inbox_subscription_survives_reconnect(broker_url: str) -> None:
         await _await_updates(updates_second)
 
     assert updates_second == [f"broker://inbox/{sid}"]
+
+
+@pytest.mark.anyio
+async def test_inbox_event_reaches_the_listen_bus_with_no_legacy_subscriber() -> None:
+    """The 2026-07-28 delivery path is fed even when nobody used the old one.
+
+    At that era the SDK drops ``send_resource_updated`` with a debug log and
+    delivers only on ``subscriptions/listen`` streams, while the capability
+    still advertises ``subscribe=True`` (it tracks whether listen is served).
+    A client would therefore subscribe, believe it is armed, and never hear
+    anything — the failure is silent, so it needs a test rather than a
+    reviewer noticing.
+
+    Deliberately runs with an empty ``resource_subscribers``: that is exactly
+    the modern-era shape, and it is the state the pre-fix early return bailed
+    on before reaching the bus.
+    """
+    import server
+
+    if getattr(server.mcp, "_subscriptions", None) is None:
+        pytest.skip("mcp 1.x has no subscriptions/listen bus")
+
+    published: list[Any] = []
+
+    class _Recorder:
+        async def publish(self, event: Any) -> None:
+            published.append(event)
+
+    sid = "bus-probe-session"
+    original = server.mcp._subscriptions
+    server.mcp._subscriptions = _Recorder()
+    try:
+        async with server.registry_lock:
+            server.resource_subscribers.pop(sid, None)
+        await server._notify_inbox_updated(sid)
+    finally:
+        server.mcp._subscriptions = original
+
+    assert [getattr(e, "uri", None) for e in published] == [f"broker://inbox/{sid}"]

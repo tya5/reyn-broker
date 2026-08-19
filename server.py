@@ -278,11 +278,24 @@ def _advertise_resource_subscribe() -> None:
     rather than rebuilding the capability set, so anything else the SDK
     decides (tools, prompts, listChanged) keeps flowing through unchanged.
 
-    On mcp 2.0 the SDK derives the flag from whether a
-    ``resources/subscribe`` handler is registered, so this wrapper finds
-    it already true and leaves it alone. Kept (rather than deleted) only
-    because the floor is still ``mcp>=1.27``; drop it when that moves
-    past 1.x.
+    On mcp 2.0 the derivation depends on the negotiated protocol version
+    (read from ``get_capabilities`` itself, not from a summary of it):
+
+    - pre-2026-07-28: ``subscribe`` comes from whether a
+      ``resources/subscribe`` handler is registered — so the wrapper finds
+      it already true and leaves it alone. This is the branch every
+      current client lands in (measured: our peers negotiate 2025-11-25).
+    - 2026-07-28+: ``subscribe`` tracks ``subscriptions/listen`` instead,
+      and the SDK says of the old handler that it is "ignored" because
+      "the modern wire cannot dispatch" it.
+
+    That second branch matters beyond this docstring: on a modern
+    handshake our handler is not merely unadvertised, it is unreachable.
+    Keeping ``resources/subscribe`` only serves clients that negotiate the
+    older era — see reyn-broker#20 for when that stops being true.
+
+    Kept (rather than deleted) because the floor is still ``mcp>=1.27``;
+    drop it when that moves past 1.x.
     """
     server = _lowlevel_server()
     inner = server.get_capabilities
@@ -402,6 +415,27 @@ def _register_resource_subscription_handlers() -> None:
     )
 
 
+async def _publish_inbox_event(uri: AnyUrl) -> None:
+    """Publish a resource-updated event on the ``subscriptions/listen`` bus.
+
+    No-op on mcp 1.x, which has no bus. The bus matches each stream's
+    filter against the URI as an exact string, and our URIs already carry
+    the session id, so per-session isolation comes from the URI itself
+    rather than from anything we track here.
+    """
+    bus = getattr(mcp, "_subscriptions", None)
+    if bus is None:  # mcp 1.x
+        return
+    try:
+        from mcp.shared.subscriptions import ResourceUpdated
+    except ModuleNotFoundError:
+        return
+    try:
+        await bus.publish(ResourceUpdated(uri=str(uri)))
+    except Exception as exc:
+        logger.warning("listen-bus publish for %s failed: %s", uri, exc)
+
+
 async def _notify_inbox_updated(session_id: str) -> None:
     """Tell subscribers that ``session_id``'s inbox resource changed.
 
@@ -410,12 +444,29 @@ async def _notify_inbox_updated(session_id: str) -> None:
     read is non-destructive, a client that misses this notification still
     finds the message waiting — wake-ups are at-least-once, not
     exactly-once.
+
+    Two delivery paths, because a single one is silently era-specific:
+
+    - ``resources/subscribe`` + ``send_resource_updated`` reaches clients
+      that negotiated below 2026-07-28.
+    - the ``subscriptions/listen`` bus reaches clients at 2026-07-28+,
+      where the SDK *drops* ``send_resource_updated`` with only a debug
+      log (``mcp/server/connection.py``: "delivered via
+      subscriptions/listen at this era").
+
+    Sending on just the legacy path would fail in the worst way on a
+    modern handshake: the capability still advertises ``subscribe=True``
+    (it tracks ``subscriptions/listen``, which the SDK serves by default),
+    so the client subscribes, believes it is armed, and never hears
+    anything. Publish first, so the bus is fed even when no legacy
+    subscriber exists.
     """
+    uri = AnyUrl(f"{_INBOX_URI_PREFIX}{session_id}")
+    await _publish_inbox_event(uri)
     async with registry_lock:
         subs = list(resource_subscribers.get(session_id, ()))
     if not subs:
         return
-    uri = AnyUrl(f"{_INBOX_URI_PREFIX}{session_id}")
     dead: list[ServerSession] = []
     for session in subs:
         try:
