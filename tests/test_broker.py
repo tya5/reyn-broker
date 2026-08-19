@@ -1696,9 +1696,13 @@ async def test_inbox_event_reaches_the_listen_bus_with_no_legacy_subscriber() ->
 def test_bind_address_knob_reaches_the_sdk() -> None:
     """BROKER_HOST/BROKER_PORT must actually change where the server binds.
 
-    The knob travels two hops (env -> argparse default -> SDK), and the
-    SDK-facing hop is version-specific: 1.x reads ``mcp.settings``, 2.0
-    takes run() kwargs. 2.0 still has a ``settings`` object, so a
+    ``BROKER_LOG_LEVEL`` travels the same env -> argparse -> consumer
+    route without needing a gate, so the number of hops is not what marks
+    this one out: its last hop lands somewhere version-specific, and
+    which SDK is installed decides where the value has to go.
+
+    1.x reads ``mcp.settings``; 2.0 takes run() kwargs but still has a
+    ``settings`` object, so a
     ``settings is not None`` test picks the 1.x path and then dies on
     ``ValueError: "Settings" object has no field "host"`` — startup, not
     just the knob.
