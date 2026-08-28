@@ -446,11 +446,20 @@ def _reject_unknown_tool_arguments() -> None:
     argument raises inside the tool-call handler's own try/except, which
     already converts any exception to a normal (non-crashing) tool-error
     result — see ``Server.call_tool`` in ``mcp/server/lowlevel/server.py``.
+
+    ``*args`` (not just ``**kwargs``) because the caller's own calling
+    convention for ``context`` differs by SDK version: mcp 1.x's
+    ``FastMCP.call_tool`` passes it as a keyword
+    (``context=context, convert_result=True``), 2.0+'s ``MCPServer.call_tool``
+    passes it positionally (``self._tool_manager.call_tool(name, arguments,
+    context, convert_result=True)``) — confirmed by reading both call sites,
+    not inferred. A ``**kwargs``-only signature is 1.x-only and breaks 2.0
+    with ``call_tool() takes 2 positional arguments but 3 were given``.
     """
     tool_manager = mcp._tool_manager
     inner = tool_manager.call_tool
 
-    async def call_tool(name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
+    async def call_tool(name: str, arguments: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
         tool = tool_manager.get_tool(name)
         if tool is not None:
             known = set(tool.fn_metadata.arg_model.model_fields)
@@ -460,7 +469,7 @@ def _reject_unknown_tool_arguments() -> None:
                     f"unknown argument(s) for '{name}': {sorted(unknown)}; "
                     f"expected one of: {sorted(known)}"
                 )
-        return await inner(name, arguments, **kwargs)
+        return await inner(name, arguments, *args, **kwargs)
 
     tool_manager.call_tool = call_tool  # type: ignore[method-assign]
 
