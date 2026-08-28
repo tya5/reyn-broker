@@ -4,6 +4,22 @@ All notable changes to reyn-broker are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`broadcast_message` fail-open on a bad recipients argument** (#22).
+  Two related gaps, both observed live: (1) an unknown tool argument (e.g.
+  `targets=[...]`, meant to be `recipients=`) was silently accepted and
+  dropped by the SDK's default `extra="ignore"` arg-model config — so the
+  call fell through to `recipients=None` and broadcast to *everyone*
+  instead of the intended subset; (2) an unregistered id inside a
+  correctly-spelled `recipients=[...]` was silently filtered out of both
+  delivery and the return value, so `recipients=["typo1","typo2"]`
+  returned `"broadcast to 0 sessions"` — indistinguishable from a genuine
+  zero-recipient broadcast. Fixed both: any unknown tool argument now
+  errors instead of being ignored (broker-wide, not just this one tool),
+  and an unregistered `recipients` id is still queued (delivered if that
+  session registers later) but named as NOT REGISTERED in the return
+  value, matching `post_message`'s existing #14 behaviour.
+
 ### Added
 - **`subscribe_plugin_notifications` / `unsubscribe_plugin_notifications` /
   `list_plugin_notification_subscribers`** (#26). A plugin with a single

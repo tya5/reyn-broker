@@ -421,6 +421,59 @@ def _register_resource_subscription_handlers() -> None:
     )
 
 
+def _reject_unknown_tool_arguments() -> None:
+    """Turn an unknown tool-call argument into an error, not a silent no-op.
+
+    Each tool's arg model is built by the SDK with pydantic's default
+    ``extra="ignore"`` (no explicit ``ConfigDict`` override anywhere in
+    ``mcp.server.fastmcp.utilities.func_metadata``), so a misspelled
+    keyword — e.g. ``targets=`` meant to be ``recipients=`` — is silently
+    dropped before the tool function ever runs. For an argument that
+    decides *who receives a message* that is fail-open: the caller thinks
+    it addressed a subset and the broker addresses everyone instead
+    (reyn-broker#22, observed live: a spelling error broadcast to all 13
+    registered sessions instead of the intended 2).
+
+    Wraps ``ToolManager.call_tool`` — the one place every tool call passes
+    through — rather than each tool's arg model, and rather than
+    ``FastMCP.call_tool``: the low-level server captures a bound reference
+    to ``FastMCP.call_tool`` at registration time
+    (``self._mcp_server.call_tool(validate_input=False)(self.call_tool)``
+    in the SDK), so patching the ``mcp`` instance's ``call_tool`` after the
+    fact would never be reached — ``self._tool_manager`` is instead looked
+    up fresh on every call, so patching the manager instance's method here
+    is the earliest point a wrapper actually takes effect. An unknown
+    argument raises inside the tool-call handler's own try/except, which
+    already converts any exception to a normal (non-crashing) tool-error
+    result — see ``Server.call_tool`` in ``mcp/server/lowlevel/server.py``.
+
+    ``*args`` (not just ``**kwargs``) because the caller's own calling
+    convention for ``context`` differs by SDK version: mcp 1.x's
+    ``FastMCP.call_tool`` passes it as a keyword
+    (``context=context, convert_result=True``), 2.0+'s ``MCPServer.call_tool``
+    passes it positionally (``self._tool_manager.call_tool(name, arguments,
+    context, convert_result=True)``) — confirmed by reading both call sites,
+    not inferred. A ``**kwargs``-only signature is 1.x-only and breaks 2.0
+    with ``call_tool() takes 2 positional arguments but 3 were given``.
+    """
+    tool_manager = mcp._tool_manager
+    inner = tool_manager.call_tool
+
+    async def call_tool(name: str, arguments: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+        tool = tool_manager.get_tool(name)
+        if tool is not None:
+            known = set(tool.fn_metadata.arg_model.model_fields)
+            unknown = set(arguments) - known
+            if unknown:
+                raise ValueError(
+                    f"unknown argument(s) for '{name}': {sorted(unknown)}; "
+                    f"expected one of: {sorted(known)}"
+                )
+        return await inner(name, arguments, *args, **kwargs)
+
+    tool_manager.call_tool = call_tool  # type: ignore[method-assign]
+
+
 async def _publish_inbox_event(uri: AnyUrl) -> None:
     """Publish a resource-updated event on the ``subscriptions/listen`` bus.
 
@@ -493,6 +546,7 @@ async def _notify_inbox_updated(session_id: str) -> None:
             resource_subscribers.pop(session_id, None)
 
 
+_reject_unknown_tool_arguments()
 _advertise_resource_subscribe()
 _register_resource_subscription_handlers()
 
@@ -1110,9 +1164,14 @@ async def broadcast_message(
     ``receive_messages``).
 
     ``recipients`` — optional list of session ids to limit the broadcast
-    to a specific subset. Only sessions in this list (and currently
-    registered) receive the message. ``exclude_self`` still applies.
-    When omitted all registered sessions receive the message.
+    to a specific subset. ``exclude_self`` still applies. When omitted,
+    every registered session receives the message.
+
+    An id in ``recipients`` that has never registered is still queued
+    (so it is not lost if that session registers later) but reported
+    separately in the return value as NOT REGISTERED, same as
+    ``post_message`` (reyn-broker#22) — a typo'd id and a real recipient
+    that just happens to be unregistered yet are otherwise indistinguishable.
     """
     _tool_call_counts["broadcast_message"] += 1
     sent_at = _now_iso()
@@ -1125,12 +1184,10 @@ async def broadcast_message(
 
     async with registry_lock:
         if recipients is not None:
-            targets = [
-                sid for sid in recipients
-                if sid in sessions and not (exclude_self and sid == from_session)
-            ]
+            targets = [sid for sid in recipients if not (exclude_self and sid == from_session)]
         else:
             targets = [sid for sid in sessions if not (exclude_self and sid == from_session)]
+        unregistered = [sid for sid in targets if sid not in sessions]
         payload["recipient_count"] = len(targets)
         for sid in targets:
             pending[sid].append(payload)
@@ -1142,10 +1199,16 @@ async def broadcast_message(
         _save_state()
 
     for sid in targets:
-        await _deliver(sid, payload)
+        if sid not in unregistered:  # nobody home to push to yet
+            await _deliver(sid, payload)
         await _notify_inbox_updated(sid)
 
-    return f"broadcast to {len(targets)} sessions"
+    if not unregistered:
+        return f"broadcast to {len(targets)} sessions"
+    return (
+        f"broadcast to {len(targets)} sessions"
+        f" (NOT REGISTERED: {', '.join(unregistered)})"
+    )
 
 
 @mcp.tool()

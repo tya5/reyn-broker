@@ -91,6 +91,11 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 
 ## MCP tools
 
+A misspelled or unrecognized argument to any tool call is rejected as an
+error rather than silently dropped — e.g. `broadcast_message(...,
+targets=[...])` (the real kwarg is `recipients`) fails loudly instead of
+falling back to `recipients`'s default and broadcasting to everyone.
+
 | Tool                | Args                                            | Effect                                                                          |
 |---------------------|-------------------------------------------------|---------------------------------------------------------------------------------|
 | `register_session`  | `session_id`, `working_dir`, `role?`, `ttl_hours?` | Register this client. Returns `status` and `pending_messages` (drained backlog). `ttl_hours` sets an auto-expiry for the session. |
@@ -98,7 +103,7 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `startup_summary`   | `session_id`, `working_dir`, `role?`, `compact?`, `ttl_hours?` | Register + list in one round-trip. Returns `status`, `pending_messages`, and `sessions` (compact by default). |
 | `list_sessions`     | `compact?`                                      | Return registered sessions. `compact=True` returns only `session_id`+`role` (~60% fewer tokens). Full shape includes activity timestamps. |
 | `post_message`      | `to`, `from_session`, `message`, `request_read_ack?`, `recipients?`, `ttl_seconds?` | Queue a message. `recipients=[...]` for multi-target; `ttl_seconds` for auto-expiry. |
-| `broadcast_message` | `from_session`, `message`, `exclude_self?`, `recipients?` | Queue the same message in every registered session's inbox (sender skipped by default). `recipients=[...]` limits to a subset. |
+| `broadcast_message` | `from_session`, `message`, `exclude_self?`, `recipients?` | Queue the same message in every registered session's inbox (sender skipped by default). `recipients=[...]` limits to a subset; an unregistered id in it is still queued (delivered if that id registers later) but named as NOT REGISTERED in the return value. |
 | `receive_messages`  | `session_id`, `fields?`                         | Drain and return the caller's inbox. `fields=["from","message"]` strips metadata to reduce token overhead. |
 | `peek_messages`     | `session_id`, `limit?`, `fields?`              | Non-destructive content preview: returns up to `limit` (default 10) messages without draining. Supports `fields` selector. |
 | `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
