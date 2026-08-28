@@ -72,6 +72,18 @@ def _payload(result: Any) -> Any:
     return items
 
 
+def _is_error(result: Any) -> bool:
+    """Return whether a CallToolResult reports a tool-error.
+
+    Spelled ``isError`` on mcp 1.x and ``is_error`` on 2.0 — same version
+    split as ``_payload``'s ``structuredContent``/``structured_content``.
+    Reading only one silently reads False on the other version, which
+    looks like the call succeeded (reproduced this exact false negative
+    against a real mcp 2.1.1 CI run before writing this helper).
+    """
+    return bool(getattr(result, "isError", None) or getattr(result, "is_error", None))
+
+
 def _msg_core(msg: dict) -> dict:
     """Return only the user-visible fields of a message payload.
 
@@ -982,7 +994,7 @@ async def test_unknown_tool_argument_is_rejected_not_ignored(broker_url: str) ->
                 "targets": ["bob"],  # misspelled: the real kwarg is "recipients"
             },
         )
-        assert getattr(result, "isError", False) is True
+        assert _is_error(result)
         text = result.content[0].text
         assert "targets" in text
 
