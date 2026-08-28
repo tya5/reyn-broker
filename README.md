@@ -115,9 +115,45 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `list_plugin_commands` | `session_id`                                  | Retrieve a plugin's declared command schema.                                    |
 | `health_check`      | *(none)*                                        | Returns `version`, `started_at_iso`, `uptime_seconds`, `session_count`, `total_pending`. |
 
+### Resources — subscribing to an inbox
+
+| Resource | Description |
+|---|---|
+| `broker://inbox/{session_id}` | Non-destructive view of one session's inbox: `{session_id, registered, pending_count, messages}`. |
+
+The server advertises `resources.subscribe`, so instead of polling
+`receive_messages` a client can subscribe to its own inbox URI and be woken
+by `notifications/resources/updated` when mail arrives:
+
+```
+resources/subscribe  broker://inbox/<your-session-id>
+  → woken on new mail
+  → read the resource to see what arrived (does not consume it)
+  → receive_messages to drain
+```
+
+Two properties worth knowing:
+
+- **One resource per session, not one shared feed.** A subscriber is woken
+  only by its own mail; a single global URI would wake every peer on every
+  message.
+- **Reading is non-destructive.** Only `receive_messages` drains. A missed
+  notification is therefore not a lost message — the mail is still there on
+  the next read, which makes wake-ups at-least-once rather than
+  exactly-once.
+
+Subscriptions live in memory and belong to a connection: after a broker
+restart, clients re-subscribe and re-read to catch up.
+
 `role` is a short free-text label (e.g. `"PR review"`, `"e2e tests"`) so
 peers can find you via `list_sessions` without relying on naming conventions.
 It is optional; sessions that omit it appear with `role: null`.
+
+`post_message` distinguishes a recipient that has never registered from one
+that is registered but idle: the former is reported as `NOT REGISTERED`
+rather than `online=False`. The message is queued either way (a session may
+legitimately register after mail is sent for it), but a typo'd or
+wrong-namespace id no longer looks like a peer who happens to be away.
 
 `request_read_ack=True` on `post_message` makes the broker queue a
 `read-ack` notification (from `"broker"`) back to the sender's inbox the

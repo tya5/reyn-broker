@@ -26,10 +26,11 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
+from pydantic import AnyUrl
 
 logger = logging.getLogger("broker")
 
-_VERSION = "0.15.4"
+_VERSION = "0.16.0"
 _STARTED_AT_TS: float = time.time()
 _tool_call_counts: dict[str, int] = defaultdict(int)
 # Optional session that receives a copy of every posted/broadcast message.
@@ -82,6 +83,11 @@ plugins: dict[str, PluginEntry] = {}
 event_subscriptions: dict[str, list[EventSubscription]] = {}
 # session_id → list of command dicts ({name, description, args})
 plugin_commands: dict[str, list[dict[str, Any]]] = {}
+# session_id (parsed out of broker://inbox/<id>) → live ServerSessions that
+# subscribed to that inbox resource. Deliberately not persisted: a subscription
+# is a property of an open connection, so after a restart there is nothing to
+# restore — clients re-subscribe on reconnect and re-read to catch up.
+resource_subscribers: dict[str, list[ServerSession]] = defaultdict(list)
 registry_lock = asyncio.Lock()
 # Live asyncio subprocess handles (not persisted — lost on broker restart)
 _plugin_procs: dict[str, Any] = {}
@@ -229,6 +235,132 @@ atexit.register(_terminate_all_plugins_atexit)
 
 
 mcp = FastMCP("broker", lifespan=_lifespan)
+
+
+def _advertise_resource_subscribe() -> None:
+    """Advertise ``resources.subscribe: true`` in the initialize response.
+
+    The SDK hardcodes ``subscribe=False`` when building
+    ``ResourcesCapability`` (``lowlevel/server.py: get_capabilities``), and
+    ``NotificationOptions`` exposes no knob for it — only ``*_changed``
+    flags. Registering a ``SubscribeRequest`` handler does not change the
+    advertisement either. So a server can honour subscriptions while
+    telling every client it cannot, and a client that trusts the
+    advertisement will never subscribe.
+
+    reyn refuses to connect when the capability is absent rather than
+    silently degrading (its ``mcp/client.py`` requires it), so without this
+    the whole feature fails at the handshake. We wrap ``get_capabilities``
+    rather than rebuilding the capability set, so anything else the SDK
+    decides (tools, prompts, listChanged) keeps flowing through unchanged.
+
+    ★ Needed on mcp 1.x only. mcp 2.0 derives ``resources.subscribe`` from
+    whether a subscribe handler is registered (confirmed live in reyn
+    #4368), which is what we do just below — so on 2.x this wrapper is
+    redundant rather than wrong. It no-ops itself in that case instead of
+    stacking on top of the SDK's own derivation; drop the whole function
+    once the floor moves past 1.x.
+    """
+    server = mcp._mcp_server
+    inner = server.get_capabilities
+
+    def get_capabilities(*args: Any, **kwargs: Any) -> Any:
+        caps = inner(*args, **kwargs)
+        resources = caps.resources
+        if resources is not None and not resources.subscribe:
+            resources.subscribe = True
+        return caps
+
+    server.get_capabilities = get_capabilities  # type: ignore[method-assign]
+
+
+_INBOX_URI_PREFIX = "broker://inbox/"
+
+
+def _session_id_from_inbox_uri(uri: Any) -> str | None:
+    """Return the session id in ``broker://inbox/<id>``, or None if not one."""
+    text = str(uri)
+    if not text.startswith(_INBOX_URI_PREFIX):
+        return None
+    return text[len(_INBOX_URI_PREFIX) :].strip("/") or None
+
+
+def _register_resource_subscription_handlers() -> None:
+    """Honour ``resources/subscribe`` for ``broker://inbox/<session_id>``.
+
+    FastMCP does not register these handlers, so without them a subscribe
+    request is answered with "method not found" even though we advertise
+    the capability. Both halves are required: the advertisement above and
+    the handler here.
+    """
+    server = mcp._mcp_server
+
+    @server.subscribe_resource()
+    async def _subscribe(uri: Any) -> None:
+        sid = _session_id_from_inbox_uri(uri)
+        if sid is None:
+            logger.warning("ignoring subscribe to unknown resource: %s", uri)
+            return
+        session = server.request_context.session
+        async with registry_lock:
+            subs = resource_subscribers[sid]
+            if session not in subs:
+                subs.append(session)
+            count = len(subs)
+        logger.info("resource subscribe: %s (subscribers=%d)", uri, count)
+
+    @server.unsubscribe_resource()
+    async def _unsubscribe(uri: Any) -> None:
+        sid = _session_id_from_inbox_uri(uri)
+        if sid is None:
+            return
+        session = server.request_context.session
+        async with registry_lock:
+            subs = resource_subscribers.get(sid)
+            if subs is not None:
+                if session in subs:
+                    subs.remove(session)
+                if not subs:
+                    resource_subscribers.pop(sid, None)
+        logger.info("resource unsubscribe: %s", uri)
+
+
+async def _notify_inbox_updated(session_id: str) -> None:
+    """Tell subscribers that ``session_id``'s inbox resource changed.
+
+    Best-effort: a subscriber whose connection has gone is dropped rather
+    than allowed to break delivery for the others. Because the resource
+    read is non-destructive, a client that misses this notification still
+    finds the message waiting — wake-ups are at-least-once, not
+    exactly-once.
+    """
+    async with registry_lock:
+        subs = list(resource_subscribers.get(session_id, ()))
+    if not subs:
+        return
+    uri = AnyUrl(f"{_INBOX_URI_PREFIX}{session_id}")
+    dead: list[ServerSession] = []
+    for session in subs:
+        try:
+            await session.send_resource_updated(uri)
+        except Exception as exc:
+            logger.warning("resource-updated for %s failed: %s", session_id, exc)
+            dead.append(session)
+    if not dead:
+        return
+    async with registry_lock:
+        subs_now = resource_subscribers.get(session_id)
+        if subs_now is None:
+            return
+        for session in dead:
+            if session in subs_now:
+                subs_now.remove(session)
+        if not subs_now:
+            resource_subscribers.pop(session_id, None)
+
+
+_advertise_resource_subscribe()
+_register_resource_subscription_handlers()
 
 
 def _save_state() -> None:
@@ -771,11 +903,20 @@ async def post_message(
 
     online: list[str] = []
     offline: list[str] = []
+    unregistered: list[str] = []
 
     async with registry_lock:
         for target in targets:
             pending[target].append(dict(payload))
-            (online if target in sessions else offline).append(target)
+            if target in sessions:
+                (online if sessions[target].active else offline).append(target)
+            else:
+                # Queued, but nobody will ever drain it unless a session
+                # registers under this exact id. Reported separately so the
+                # sender can tell a typo'd/unknown id from a real peer that
+                # happens to be idle — the two are indistinguishable
+                # otherwise (reyn-broker#14).
+                unregistered.append(target)
         if from_session in sessions:
             sessions[from_session].last_post_at = sent_at
         if _MONITOR_SID and _MONITOR_SID not in targets and from_session != _MONITOR_SID:
@@ -784,17 +925,33 @@ async def post_message(
         _push_session_event_locked("posted", from_session)
         _save_state()
 
-    for target in online:
+    for target in (*online, *offline):
         push_payload = _strip_internal(payload)
         await _deliver(target, push_payload)
 
+    # Wake resource subscribers regardless of registration: a client can
+    # subscribe to an inbox before (or without) registering a session.
+    for target in targets:
+        await _notify_inbox_updated(target)
+
     if len(targets) == 1:
-        return f"queued for '{targets[0]}' (online={targets[0] in online})"
-    return (
-        f"queued for {len(targets)} recipients"
-        f" (online: {', '.join(online) or 'none'}"
-        f"; offline: {', '.join(offline) or 'none'})"
-    )
+        target = targets[0]
+        if target in unregistered:
+            return (
+                f"queued for '{target}' (NOT REGISTERED — no session has ever"
+                f" registered this id; check the session_id, it is a different"
+                f" namespace from ListAgents names)"
+            )
+        return f"queued for '{target}' (online={target in online})"
+    parts = [
+        f"queued for {len(targets)} recipients",
+        f" (online: {', '.join(online) or 'none'}",
+        f"; offline: {', '.join(offline) or 'none'}",
+    ]
+    if unregistered:
+        parts.append(f"; NOT REGISTERED: {', '.join(unregistered)}")
+    parts.append(")")
+    return "".join(parts)
 
 
 @mcp.tool()
@@ -847,6 +1004,7 @@ async def broadcast_message(
 
     for sid in targets:
         await _deliver(sid, payload)
+        await _notify_inbox_updated(sid)
 
     return f"broadcast to {len(targets)} sessions"
 
@@ -882,6 +1040,46 @@ async def receive_messages(
     if fields is not None:
         msgs = [{k: v for k, v in m.items() if k in fields} for m in msgs]
     return msgs
+
+
+@mcp.resource(
+    "broker://inbox/{session_id}",
+    name="broker-inbox",
+    title="Broker inbox",
+    description=(
+        "Non-destructive view of one session's inbox. Subscribe to this URI to"
+        " be woken by notifications/resources/updated when mail arrives, then"
+        " drain with the receive_messages tool. Reading never removes messages,"
+        " so a missed notification is not a lost message."
+    ),
+    mime_type="application/json",
+)
+async def inbox_resource(session_id: str) -> str:
+    """Return ``session_id``'s queued messages without draining them.
+
+    One resource per session (rather than one global feed) so a subscriber
+    is woken only by its own mail — a single shared URI would wake every
+    peer on every message.
+
+    Deliberately non-destructive: reading is what a woken client does
+    *before* it decides to act, and ``receive_messages`` remains the only
+    thing that removes messages. If a client misses an ``updated``
+    notification the messages are still here, so wake-ups are
+    at-least-once rather than exactly-once.
+    """
+    _tool_call_counts["inbox_resource"] += 1
+    async with registry_lock:
+        msgs = [_strip_internal(m) for m in _purge_expired(pending.get(session_id, []))]
+        registered = session_id in sessions
+    return json.dumps(
+        {
+            "session_id": session_id,
+            "registered": registered,
+            "pending_count": len(msgs),
+            "messages": msgs,
+        },
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()

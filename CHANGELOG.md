@@ -2,6 +2,37 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [0.16.0] - 2026-08-13
+
+### Added
+- **Inboxes are now MCP resources you can subscribe to** (#13). Each session's
+  inbox is exposed at `broker://inbox/<session_id>` and the server advertises
+  `resources.subscribe`, so a client can be woken by
+  `notifications/resources/updated` instead of polling `receive_messages`.
+  One resource per session rather than a single shared feed — a subscriber is
+  woken only by its own mail.
+
+  Reading the resource is **non-destructive**: it never removes messages, and
+  `receive_messages` remains the only thing that drains. A client that misses
+  a notification still finds the message waiting, so wake-ups are
+  at-least-once rather than exactly-once.
+
+  Note for future SDK bumps: on mcp 1.x the `resources.subscribe` capability
+  had to be set explicitly — `Server.get_capabilities` hardcodes
+  `subscribe=False` and registering a subscribe handler does not change that.
+  mcp 2.0 derives the flag from handler registration instead, at which point
+  `_advertise_resource_subscribe()` becomes redundant and can be dropped.
+
+### Fixed
+- **`post_message` to an unregistered recipient now says so** (#14).
+  Previously an unknown session id and a registered-but-idle peer both came
+  back as `online=False`, so a typo'd or wrong-namespace id looked exactly
+  like a peer that happened to be away, and the message sat in a queue nobody
+  would ever drain. Unregistered targets are now reported separately (single
+  and multi-recipient forms). Delivery behaviour is unchanged — posting to a
+  not-yet-registered session is still allowed, since sessions legitimately
+  register after mail is sent for them.
+
 ## [0.15.4] - 2026-06-13
 
 ### Fixed
