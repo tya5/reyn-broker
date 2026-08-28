@@ -40,10 +40,9 @@ async def _transport(url: str):
 
 @asynccontextmanager
 async def _client(url: str):
-    async with _transport(url) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
+    async with _transport(url) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        yield session
 
 
 def _payload(result: Any) -> Any:
@@ -1539,12 +1538,11 @@ async def _subscriber_client(url: str, updates: list[str]):
         if uri is not None:
             updates.append(str(uri))
 
-    async with _transport(url) as (read, write):
-        async with ClientSession(
-            read, write, message_handler=_on_message
-        ) as session:
-            await session.initialize()
-            yield session
+    async with _transport(url) as (read, write), ClientSession(
+        read, write, message_handler=_on_message
+    ) as session:
+        await session.initialize()
+        yield session
 
 
 async def _await_updates(updates: list[str], *, minimum: int = 1) -> None:
@@ -1564,9 +1562,8 @@ async def test_resources_subscribe_capability_is_advertised(broker_url: str) -> 
     ``_advertise_resource_subscribe``. Without the advertisement a client
     that trusts it will never subscribe at all.
     """
-    async with _transport(broker_url) as (read, write):
-        async with ClientSession(read, write) as session:
-            init = await session.initialize()
+    async with _transport(broker_url) as (read, write), ClientSession(read, write) as session:
+        init = await session.initialize()
     assert init.capabilities.resources is not None
     assert init.capabilities.resources.subscribe is True
 

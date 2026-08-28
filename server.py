@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 try:  # mcp 2.0+
-    from mcp.server.mcpserver import Context, MCPServer as FastMCP
+    from mcp.server.mcpserver import Context
+    from mcp.server.mcpserver import MCPServer as FastMCP
 except ModuleNotFoundError:  # mcp 1.x
     from mcp.server.fastmcp import Context, FastMCP  # type: ignore[assignment,no-redef]
 from mcp.server.session import ServerSession
