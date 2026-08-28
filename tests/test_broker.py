@@ -927,8 +927,15 @@ async def test_broadcast_subset_excludes_self(broker_url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_broadcast_subset_skips_unregistered(broker_url: str) -> None:
-    """Sessions listed in recipients but not registered are silently skipped."""
+async def test_broadcast_subset_names_unregistered(broker_url: str) -> None:
+    """Unregistered ids in ``recipients`` are queued and named, not silently dropped.
+
+    Pins reyn-broker#22 ②: previously an unregistered id was filtered out
+    of ``targets`` entirely, so ``recipients=["ghost1","ghost2"]`` (both
+    typo'd or not-yet-registered) returned "broadcast to 0 sessions" —
+    indistinguishable from a genuine zero-recipient broadcast. Queuing
+    means a session that registers under that id later still gets it.
+    """
     async with _client(broker_url) as a:
         await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
         result = await a.call_tool(
@@ -939,8 +946,49 @@ async def test_broadcast_subset_skips_unregistered(broker_url: str) -> None:
                 "recipients": ["ghost1", "ghost2"],
             },
         )
-    text = result.content[0].text
-    assert "broadcast to 0 sessions" in text
+        text = result.content[0].text
+        assert "broadcast to 2 sessions" in text
+        assert "NOT REGISTERED: ghost1, ghost2" in text
+
+        # queued, not lost: registering under that id now delivers the backlog
+        backlog = _payload(await a.call_tool(
+            "register_session", {"session_id": "ghost1", "working_dir": "/tmp/g"}
+        ))["pending_messages"]
+    assert [m["message"] for m in backlog] == ["hello ghost"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_argument_is_rejected_not_ignored(broker_url: str) -> None:
+    """A misspelled kwarg errors instead of silently falling back to its default.
+
+    Pins reyn-broker#22 ①. The live incident this pins: calling
+    ``broadcast_message(..., targets=[...])`` (meant to be ``recipients``)
+    was silently accepted with ``targets`` dropped, so ``recipients``
+    stayed at its ``None`` default and the message broadcast to every
+    registered session instead of the intended subset. The SDK's arg model
+    uses ``extra="ignore"`` by default, so this is asserted end to end
+    through the real tool-call path (``ClientSession.call_tool`` sends
+    whatever dict it is given — no client-side schema filtering to work
+    around) rather than by inspecting the arg model directly.
+    """
+    async with _client(broker_url) as a, _client(broker_url) as b:
+        await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
+        await b.call_tool("register_session", {"session_id": "bob", "working_dir": "/tmp/b"})
+        result = await a.call_tool(
+            "broadcast_message",
+            {
+                "from_session": "alice",
+                "message": "should not go anywhere",
+                "targets": ["bob"],  # misspelled: the real kwarg is "recipients"
+            },
+        )
+        assert getattr(result, "isError", False) is True
+        text = result.content[0].text
+        assert "targets" in text
+
+        # and, crucially, it did not fall through to a full broadcast
+        bob_inbox = _payload(await b.call_tool("receive_messages", {"session_id": "bob"}))
+    assert bob_inbox == []
 
 
 # ---------------------------------------------------------------------------
