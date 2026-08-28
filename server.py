@@ -24,7 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import Context, FastMCP
+try:  # mcp 2.0+
+    from mcp.server.mcpserver import Context
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ModuleNotFoundError:  # mcp 1.x
+    from mcp.server.fastmcp import Context, FastMCP  # type: ignore[assignment,no-redef]
 from mcp.server.session import ServerSession
 from pydantic import AnyUrl
 
@@ -237,10 +241,31 @@ atexit.register(_terminate_all_plugins_atexit)
 mcp = FastMCP("broker", lifespan=_lifespan)
 
 
+def _lowlevel_server() -> Any:
+    """Return the SDK's low-level server object behind ``mcp``.
+
+    Both names are private, and the rename between them is exactly the kind
+    of break this indirection exists to localise: ``_mcp_server`` (1.x)
+    became ``_lowlevel_server`` (2.0), and the old name failed at import
+    time rather than degrading. There is no public accessor in either
+    version, so the dependency cannot be removed — only kept in one place
+    so the next rename is a one-line fix instead of a scavenger hunt.
+    """
+    for name in ("_lowlevel_server", "_mcp_server"):
+        server = getattr(mcp, name, None)
+        if server is not None:
+            return server
+    raise RuntimeError(
+        "MCP SDK exposes neither _lowlevel_server nor _mcp_server — the "
+        "private accessor was renamed again; find the lowlevel Server on "
+        "the FastMCP/MCPServer instance and add its name above."
+    )
+
+
 def _advertise_resource_subscribe() -> None:
     """Advertise ``resources.subscribe: true`` in the initialize response.
 
-    The SDK hardcodes ``subscribe=False`` when building
+    mcp 1.x hardcodes ``subscribe=False`` when building
     ``ResourcesCapability`` (``lowlevel/server.py: get_capabilities``), and
     ``NotificationOptions`` exposes no knob for it — only ``*_changed``
     flags. Registering a ``SubscribeRequest`` handler does not change the
@@ -254,14 +279,26 @@ def _advertise_resource_subscribe() -> None:
     rather than rebuilding the capability set, so anything else the SDK
     decides (tools, prompts, listChanged) keeps flowing through unchanged.
 
-    ★ Needed on mcp 1.x only. mcp 2.0 derives ``resources.subscribe`` from
-    whether a subscribe handler is registered (confirmed live in reyn
-    #4368), which is what we do just below — so on 2.x this wrapper is
-    redundant rather than wrong. It no-ops itself in that case instead of
-    stacking on top of the SDK's own derivation; drop the whole function
-    once the floor moves past 1.x.
+    On mcp 2.0 the derivation depends on the negotiated protocol version
+    (read from ``get_capabilities`` itself, not from a summary of it):
+
+    - pre-2026-07-28: ``subscribe`` comes from whether a
+      ``resources/subscribe`` handler is registered — so the wrapper finds
+      it already true and leaves it alone. This is the branch every
+      current client lands in (measured: our peers negotiate 2025-11-25).
+    - 2026-07-28+: ``subscribe`` tracks ``subscriptions/listen`` instead,
+      and the SDK says of the old handler that it is "ignored" because
+      "the modern wire cannot dispatch" it.
+
+    That second branch matters beyond this docstring: on a modern
+    handshake our handler is not merely unadvertised, it is unreachable.
+    Keeping ``resources/subscribe`` only serves clients that negotiate the
+    older era — see reyn-broker#20 for when that stops being true.
+
+    Kept (rather than deleted) because the floor is still ``mcp>=1.27``;
+    drop it when that moves past 1.x.
     """
-    server = mcp._mcp_server
+    server = _lowlevel_server()
     inner = server.get_capabilities
 
     def get_capabilities(*args: Any, **kwargs: Any) -> Any:
@@ -285,44 +322,119 @@ def _session_id_from_inbox_uri(uri: Any) -> str | None:
     return text[len(_INBOX_URI_PREFIX) :].strip("/") or None
 
 
+async def _add_inbox_subscriber(uri: Any, session: ServerSession) -> None:
+    """Record ``session`` as a subscriber of the inbox named by ``uri``."""
+    sid = _session_id_from_inbox_uri(uri)
+    if sid is None:
+        logger.warning("ignoring subscribe to unknown resource: %s", uri)
+        return
+    async with registry_lock:
+        subs = resource_subscribers[sid]
+        if session not in subs:
+            subs.append(session)
+        count = len(subs)
+    logger.info("resource subscribe: %s (subscribers=%d)", uri, count)
+
+
+async def _drop_inbox_subscriber(uri: Any, session: ServerSession) -> None:
+    """Forget ``session`` as a subscriber of the inbox named by ``uri``."""
+    sid = _session_id_from_inbox_uri(uri)
+    if sid is None:
+        return
+    async with registry_lock:
+        subs = resource_subscribers.get(sid)
+        if subs is not None:
+            if session in subs:
+                subs.remove(session)
+            if not subs:
+                resource_subscribers.pop(sid, None)
+    logger.info("resource unsubscribe: %s", uri)
+
+
 def _register_resource_subscription_handlers() -> None:
     """Honour ``resources/subscribe`` for ``broker://inbox/<session_id>``.
 
-    FastMCP does not register these handlers, so without them a subscribe
-    request is answered with "method not found" even though we advertise
-    the capability. Both halves are required: the advertisement above and
-    the handler here.
+    Neither FastMCP (1.x) nor MCPServer (2.0) serves these by default, so
+    without them a subscribe request is answered with "method not found"
+    even though we advertise the capability.
+
+    ``resources/subscribe`` is how pre-2026-07-28 clients ask to be woken,
+    and every live watcher is one of those today — measured, not assumed:
+    all 7 run ``session_watcher.py`` under *this* repo's venv, so they
+    speak whatever mcp version the broker pins, regardless of what the
+    peer's own venv holds (several peers are already on 2.0). Upgrading
+    the pin therefore moves every watcher at once, which is also why this
+    handler cannot be dropped on the strength of "the peers are modern".
+
+    mcp 2.0 still routes the method for exactly this reason, and serves
+    ``subscriptions/listen`` alongside it for newer clients (which we do
+    not have to implement: the SDK does it).
+
+    The two SDKs register handlers differently, and neither exposes a
+    public way to do it after construction:
+
+    - 1.x: ``@server.subscribe_resource()`` decorator
+    - 2.0: decorator removed; handlers are ``Server(...)`` kwargs, kept in
+      ``_request_handlers`` as ``HandlerEntry(params_type, handler)``
+
+    We already hold the instance, so on 2.0 we install into that table
+    directly. Both paths end at the same two functions above.
     """
-    server = mcp._mcp_server
+    server = _lowlevel_server()
 
-    @server.subscribe_resource()
-    async def _subscribe(uri: Any) -> None:
-        sid = _session_id_from_inbox_uri(uri)
-        if sid is None:
-            logger.warning("ignoring subscribe to unknown resource: %s", uri)
-            return
-        session = server.request_context.session
-        async with registry_lock:
-            subs = resource_subscribers[sid]
-            if session not in subs:
-                subs.append(session)
-            count = len(subs)
-        logger.info("resource subscribe: %s (subscribers=%d)", uri, count)
+    if hasattr(server, "subscribe_resource"):  # mcp 1.x
+        @server.subscribe_resource()
+        async def _subscribe(uri: Any) -> None:
+            await _add_inbox_subscriber(uri, server.request_context.session)
 
-    @server.unsubscribe_resource()
-    async def _unsubscribe(uri: Any) -> None:
-        sid = _session_id_from_inbox_uri(uri)
-        if sid is None:
-            return
-        session = server.request_context.session
-        async with registry_lock:
-            subs = resource_subscribers.get(sid)
-            if subs is not None:
-                if session in subs:
-                    subs.remove(session)
-                if not subs:
-                    resource_subscribers.pop(sid, None)
-        logger.info("resource unsubscribe: %s", uri)
+        @server.unsubscribe_resource()
+        async def _unsubscribe(uri: Any) -> None:
+            await _drop_inbox_subscriber(uri, server.request_context.session)
+        return
+
+    # mcp 2.0+
+    import mcp.types as _types
+    from mcp.server.lowlevel.server import HandlerEntry
+
+    async def _on_subscribe(ctx: Any, params: Any) -> Any:
+        await _add_inbox_subscriber(params.uri, ctx.session)
+        return _types.EmptyResult()
+
+    async def _on_unsubscribe(ctx: Any, params: Any) -> Any:
+        await _drop_inbox_subscriber(params.uri, ctx.session)
+        return _types.EmptyResult()
+
+    server._request_handlers.update(
+        {
+            "resources/subscribe": HandlerEntry(
+                _types.SubscribeRequestParams, _on_subscribe
+            ),
+            "resources/unsubscribe": HandlerEntry(
+                _types.UnsubscribeRequestParams, _on_unsubscribe
+            ),
+        }
+    )
+
+
+async def _publish_inbox_event(uri: AnyUrl) -> None:
+    """Publish a resource-updated event on the ``subscriptions/listen`` bus.
+
+    No-op on mcp 1.x, which has no bus. The bus matches each stream's
+    filter against the URI as an exact string, and our URIs already carry
+    the session id, so per-session isolation comes from the URI itself
+    rather than from anything we track here.
+    """
+    bus = getattr(mcp, "_subscriptions", None)
+    if bus is None:  # mcp 1.x
+        return
+    try:
+        from mcp.shared.subscriptions import ResourceUpdated
+    except ModuleNotFoundError:
+        return
+    try:
+        await bus.publish(ResourceUpdated(uri=str(uri)))
+    except Exception as exc:
+        logger.warning("listen-bus publish for %s failed: %s", uri, exc)
 
 
 async def _notify_inbox_updated(session_id: str) -> None:
@@ -333,12 +445,29 @@ async def _notify_inbox_updated(session_id: str) -> None:
     read is non-destructive, a client that misses this notification still
     finds the message waiting — wake-ups are at-least-once, not
     exactly-once.
+
+    Two delivery paths, because a single one is silently era-specific:
+
+    - ``resources/subscribe`` + ``send_resource_updated`` reaches clients
+      that negotiated below 2026-07-28.
+    - the ``subscriptions/listen`` bus reaches clients at 2026-07-28+,
+      where the SDK *drops* ``send_resource_updated`` with only a debug
+      log (``mcp/server/connection.py``: "delivered via
+      subscriptions/listen at this era").
+
+    Sending on just the legacy path would fail in the worst way on a
+    modern handshake: the capability still advertises ``subscribe=True``
+    (it tracks ``subscriptions/listen``, which the SDK serves by default),
+    so the client subscribes, believes it is armed, and never hears
+    anything. Publish first, so the bus is fed even when no legacy
+    subscriber exists.
     """
+    uri = AnyUrl(f"{_INBOX_URI_PREFIX}{session_id}")
+    await _publish_inbox_event(uri)
     async with registry_lock:
         subs = list(resource_subscribers.get(session_id, ()))
     if not subs:
         return
-    uri = AnyUrl(f"{_INBOX_URI_PREFIX}{session_id}")
     dead: list[ServerSession] = []
     for session in subs:
         try:
@@ -1062,10 +1191,17 @@ async def inbox_resource(session_id: str) -> str:
     peer on every message.
 
     Deliberately non-destructive: reading is what a woken client does
-    *before* it decides to act, and ``receive_messages`` remains the only
-    thing that removes messages. If a client misses an ``updated``
-    notification the messages are still here, so wake-ups are
+    *before* it decides to act, so a client that misses an ``updated``
+    notification still finds the message here — wake-ups are
     at-least-once rather than exactly-once.
+
+    Reading never removes anything. Two things do: ``receive_messages``
+    (the intended drain) and the TTL sweep in ``_background_purge``,
+    which drops messages posted with ``ttl_seconds`` once they expire.
+    The sweep is opt-in per message, so an inbox of ordinary messages is
+    only emptied by its owner — but "only receive_messages drains" would
+    be false, and a subscriber relying on it could lose expiring mail
+    between the wake-up and the read.
     """
     _tool_call_counts["inbox_resource"] += 1
     async with registry_lock:
@@ -1497,6 +1633,30 @@ async def list_plugins() -> list[dict[str, Any]]:
     ]
 
 
+def _apply_bind_address(host: str, port: int) -> dict[str, Any]:
+    """Route the requested bind address to wherever the installed SDK reads it.
+
+    Returns the kwargs to pass to ``mcp.run()``; on mcp 1.x the address
+    travels through ``mcp.settings`` instead and the returned mapping is
+    empty.
+
+    Split out of ``main()`` so the ``BROKER_HOST``/``BROKER_PORT`` knobs
+    can be tested end to end.
+
+    The ``hasattr`` guard is load-bearing rather than defensive: on 2.0 a
+    ``settings`` object still exists, but it has no ``host`` field and
+    pydantic rejects the assignment outright (``ValueError: "Settings"
+    object has no field "host"``). Testing only for ``settings is not
+    None`` therefore takes down startup on 2.0.
+    """
+    settings = getattr(mcp, "settings", None)
+    if settings is not None and hasattr(settings, "host"):  # mcp 1.x
+        settings.host = host
+        settings.port = port
+        return {}
+    return {"host": host, "port": port}  # mcp 2.0+
+
+
 def main() -> None:
     import argparse
 
@@ -1526,16 +1686,21 @@ def main() -> None:
         level=args.log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    mcp.settings.host = args.host
-    mcp.settings.port = args.port
+    # Where the bind address lives moved between SDK versions: 1.x reads it
+    # off ``settings``, 2.0 dropped those fields and takes host/port as
+    # run() kwargs. Passing them to a 1.x run() is not accepted, and 2.0
+    # keeps a settings object without those fields, so assigning to them
+    # raises. So branch on which one the installed SDK actually has.
+    run_kwargs = _apply_bind_address(args.host, args.port)
+
     logger.info(
         "starting broker on %s:%s (state file: %s)",
-        mcp.settings.host,
-        mcp.settings.port,
+        args.host,
+        args.port,
         _STATE_PATH,
     )
     _load_state()
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", **run_kwargs)
 
 
 if __name__ == "__main__":

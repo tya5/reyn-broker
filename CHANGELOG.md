@@ -2,6 +2,48 @@
 
 All notable changes to reyn-broker are documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Runs on both mcp 1.x and 2.0** (#16). The SDK's 2.0 release renames or
+  moves most of what the server touches, and the pieces fail at different
+  times: the import fails immediately, the private lowlevel-server handle
+  fails at startup, and `settings.host`/`settings.port` fail once the bind
+  address is applied — 2.0 keeps a `settings` object but drops those
+  fields, and pydantic rejects the assignment (`ValueError: "Settings"
+  object has no field "host"`). Each is now version-aware:
+
+  | | mcp 1.x | mcp 2.0 |
+  |---|---|---|
+  | module | `mcp.server.fastmcp` | `mcp.server.mcpserver` |
+  | class | `FastMCP` | `MCPServer` |
+  | lowlevel handle | `_mcp_server` | `_lowlevel_server` |
+  | subscribe handler | `@server.subscribe_resource()` | `Server(...)` kwargs / `_request_handlers` |
+  | bind address | `settings.host` / `.port` | `run()` kwargs |
+
+  `resources/subscribe` is kept rather than replaced. All 7 live watchers
+  are pre-2026-07-28 clients — not because the peers are on old SDKs
+  (several are already on 2.0) but because every watcher runs
+  `session_watcher.py` under *this* repo's venv, so they speak whatever
+  version the broker pins. mcp 2.0 still routes the method for exactly
+  this case. Newer clients use `subscriptions/listen`, which the 2.0 SDK
+  serves on its own — so the *method* needs nothing here, but the events
+  still do: they reach a listen stream only if the server publishes them
+  on the subscription bus, which `_publish_inbox_event()` does.
+
+  Verified on both SDKs: the suite passes under each (the listen-bus test
+  is skipped on 1.x, which has no bus), and a live 1.x client against the
+  2.0 server negotiates 2025-11-25, subscribes, is woken, reads
+  non-destructively, drains, and sees all 24 tools.
+
+### Fixed
+- **Test harness reads the same result twice.** `structuredContent` (1.x)
+  and `structured_content` (2.0) are the same field; checking only one
+  returned an empty result on the other version instead of an error.
+  Same for the notification union (`.root` on 1.x, bare on 2.0) — reading
+  only one shape recorded no wake-ups at all on the other, which looks
+  like a delivery bug rather than a harness bug.
+
 ## [0.16.0] - 2026-08-13
 
 ### Added
@@ -12,16 +54,25 @@ All notable changes to reyn-broker are documented in this file.
   One resource per session rather than a single shared feed — a subscriber is
   woken only by its own mail.
 
-  Reading the resource is **non-destructive**: it never removes messages, and
-  `receive_messages` remains the only thing that drains. A client that misses
-  a notification still finds the message waiting, so wake-ups are
-  at-least-once rather than exactly-once.
+  Reading the resource is **non-destructive**: it never removes messages, so
+  a client that misses a notification still finds the message waiting and
+  wake-ups are at-least-once rather than exactly-once. Draining is done by
+  `receive_messages`; separately, the TTL sweep drops messages posted with
+  `ttl_seconds` once they expire.
 
   Note for future SDK bumps: on mcp 1.x the `resources.subscribe` capability
   had to be set explicitly — `Server.get_capabilities` hardcodes
   `subscribe=False` and registering a subscribe handler does not change that.
-  mcp 2.0 derives the flag from handler registration instead, at which point
-  `_advertise_resource_subscribe()` becomes redundant and can be dropped.
+  mcp 2.0 derives the flag, but which input it derives from depends on the
+  negotiated protocol version: below 2026-07-28 it reads the registered
+  `resources/subscribe` handler (so the wrapper is a no-op), and at 2026-07-28+
+  it reads `subscriptions/listen` and ignores the old handler entirely —
+  the SDK's own wording is that the modern wire "cannot dispatch" it.
+
+  So dropping `_advertise_resource_subscribe()` is not the whole retirement:
+  once peers negotiate 2026-07-28, `resources/subscribe` stops being reachable,
+  not merely unadvertised. #20 tracks that, and its condition is a measurement
+  of what live watchers negotiate — not of what their SDK version pins allow.
 
 ### Fixed
 - **`post_message` to an unregistered recipient now says so** (#14).

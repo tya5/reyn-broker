@@ -13,12 +13,34 @@ from mcp.client.streamable_http import streamable_http_client
 from pydantic import AnyUrl
 
 
+def _uri(text: str) -> Any:
+    """Return a resource URI in the form the installed SDK accepts.
+
+    mcp 1.x validates these params as ``AnyUrl``; 2.0 validates them as
+    ``str`` and rejects an ``AnyUrl`` outright. Passing the wrong one is a
+    pydantic ValidationError at call time, so pick per version.
+    """
+    from mcp.types import ReadResourceRequestParams
+
+    field = ReadResourceRequestParams.model_fields["uri"]
+    return text if field.annotation is str else AnyUrl(text)
+
+
+@asynccontextmanager
+async def _transport(url: str):
+    """Yield ``(read, write)`` from the client transport.
+
+    mcp 1.x yields a third element (a session-id callback); 2.0 yields two.
+    Unpacking a fixed arity fails on whichever version you did not write
+    for, so take the first two and ignore the rest.
+    """
+    async with streamable_http_client(url) as streams:
+        yield streams[0], streams[1]
+
+
 @asynccontextmanager
 async def _client(url: str):
-    async with (
-        streamable_http_client(url) as (read, write, _close),
-        ClientSession(read, write) as session,
-    ):
+    async with _transport(url) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
         yield session
 
@@ -26,12 +48,16 @@ async def _client(url: str):
 def _payload(result: Any) -> Any:
     """Extract the structured payload from a CallToolResult.
 
-    FastMCP returns results via ``structuredContent={"result": ...}`` when
-    available. Falls back to JSON-decoding each TextContent block.
+    The field carrying it is spelled ``structuredContent`` on mcp 1.x and
+    ``structured_content`` on 2.0. Reading only one of them yields None on
+    the other version and silently falls through to the text blocks —
+    which on 2.0 are empty, so callers get an empty result rather than an
+    error. Check both.
     """
-    structured = getattr(result, "structuredContent", None)
-    if isinstance(structured, dict) and "result" in structured:
-        return structured["result"]
+    for attr in ("structured_content", "structuredContent"):
+        structured = getattr(result, attr, None)
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
     items = []
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
@@ -1501,16 +1527,20 @@ async def _subscriber_client(url: str, updates: list[str]):
     """Client that records resources/updated URIs into ``updates``."""
 
     async def _on_message(msg: Any) -> None:
-        root = getattr(msg, "root", None)
-        params = getattr(root, "params", None)
-        uri = getattr(params, "uri", None)
-        if uri is not None and type(root).__name__ == "ResourceUpdatedNotification":
+        # 1.x wraps notifications in a ServerNotification union (.root);
+        # 2.0 hands the notification over directly. Unwrap if wrapped, then
+        # match on the concrete type either way — keying off .root alone
+        # silently records nothing on 2.0.
+        note = getattr(msg, "root", msg)
+        if type(note).__name__ != "ResourceUpdatedNotification":
+            return
+        uri = getattr(getattr(note, "params", None), "uri", None)
+        if uri is not None:
             updates.append(str(uri))
 
-    async with (
-        streamable_http_client(url) as (read, write, _close),
-        ClientSession(read, write, message_handler=_on_message) as session,
-    ):
+    async with _transport(url) as (read, write), ClientSession(
+        read, write, message_handler=_on_message
+    ) as session:
         await session.initialize()
         yield session
 
@@ -1532,10 +1562,7 @@ async def test_resources_subscribe_capability_is_advertised(broker_url: str) -> 
     ``_advertise_resource_subscribe``. Without the advertisement a client
     that trusts it will never subscribe at all.
     """
-    async with (
-        streamable_http_client(broker_url) as (read, write, _close),
-        ClientSession(read, write) as session,
-    ):
+    async with _transport(broker_url) as (read, write), ClientSession(read, write) as session:
         init = await session.initialize()
     assert init.capabilities.resources is not None
     assert init.capabilities.resources.subscribe is True
@@ -1552,7 +1579,7 @@ async def test_inbox_read_does_not_drain(broker_url: str) -> None:
     message, and only a missed wake-up loses it.
     """
     sid = "res-nondestructive"
-    uri = AnyUrl(f"broker://inbox/{sid}")
+    uri = _uri(f"broker://inbox/{sid}")
     async with _client(broker_url) as c:
         await c.call_tool(
             "post_message", {"to": sid, "from_session": "sender", "message": "keep-me"}
@@ -1581,21 +1608,23 @@ async def test_inbox_updated_notification_is_per_session(broker_url: str) -> Non
     """
     updates: list[str] = []
     async with _subscriber_client(broker_url, updates) as sub:
-        await sub.subscribe_resource(AnyUrl("broker://inbox/alpha"))
+        await sub.subscribe_resource(_uri("broker://inbox/alpha"))
 
         async with _client(broker_url) as poster:
+            # Post to someone else first, then to us. Waiting a while after
+            # the first post and asserting "still nothing" would only say
+            # nothing arrived *yet* — a longer sleep makes it no truer.
+            # Ordering does: once our own wake-up lands, the other one has
+            # had its chance and demonstrably did not come.
             await poster.call_tool(
                 "post_message", {"to": "beta", "from_session": "s", "message": "not yours"}
             )
-            await asyncio.sleep(0.5)
-            assert updates == [], "woken by another session's mail"
-
             await poster.call_tool(
                 "post_message", {"to": "alpha", "from_session": "s", "message": "yours"}
             )
             await _await_updates(updates)
 
-    assert updates == ["broker://inbox/alpha"]
+    assert updates == ["broker://inbox/alpha"], "woken by another session's mail"
 
 
 @pytest.mark.asyncio
@@ -1608,11 +1637,11 @@ async def test_inbox_subscription_survives_reconnect(broker_url: str) -> None:
     sid = "reconnector"
     updates_first: list[str] = []
     async with _subscriber_client(broker_url, updates_first) as sub:
-        await sub.subscribe_resource(AnyUrl(f"broker://inbox/{sid}"))
+        await sub.subscribe_resource(_uri(f"broker://inbox/{sid}"))
 
     updates_second: list[str] = []
     async with _subscriber_client(broker_url, updates_second) as sub:
-        await sub.subscribe_resource(AnyUrl(f"broker://inbox/{sid}"))
+        await sub.subscribe_resource(_uri(f"broker://inbox/{sid}"))
         async with _client(broker_url) as poster:
             await poster.call_tool(
                 "post_message", {"to": sid, "from_session": "s", "message": "after reconnect"}
@@ -1620,3 +1649,72 @@ async def test_inbox_subscription_survives_reconnect(broker_url: str) -> None:
         await _await_updates(updates_second)
 
     assert updates_second == [f"broker://inbox/{sid}"]
+
+
+@pytest.mark.anyio
+async def test_inbox_event_reaches_the_listen_bus_with_no_legacy_subscriber() -> None:
+    """The 2026-07-28 delivery path is fed even when nobody used the old one.
+
+    At that era the SDK drops ``send_resource_updated`` with a debug log and
+    delivers only on ``subscriptions/listen`` streams, while the capability
+    still advertises ``subscribe=True`` (it tracks whether listen is served).
+    A client would therefore subscribe, believe it is armed, and never hear
+    anything — the failure is silent, so it needs a test rather than a
+    reviewer noticing.
+
+    Deliberately runs with an empty ``resource_subscribers``: that is exactly
+    the modern-era shape, and it is the state the pre-fix early return bailed
+    on before reaching the bus.
+    """
+    import server
+
+    if getattr(server.mcp, "_subscriptions", None) is None:
+        pytest.skip("mcp 1.x has no subscriptions/listen bus")
+
+    published: list[Any] = []
+
+    class _Recorder:
+        async def publish(self, event: Any) -> None:
+            published.append(event)
+
+    sid = "bus-probe-session"
+    original = server.mcp._subscriptions
+    server.mcp._subscriptions = _Recorder()
+    try:
+        async with server.registry_lock:
+            server.resource_subscribers.pop(sid, None)
+        await server._notify_inbox_updated(sid)
+    finally:
+        server.mcp._subscriptions = original
+
+    assert [getattr(e, "uri", None) for e in published] == [f"broker://inbox/{sid}"]
+
+
+def test_bind_address_knob_reaches_the_sdk() -> None:
+    """BROKER_HOST/BROKER_PORT must actually change where the server binds.
+
+    ``BROKER_LOG_LEVEL`` travels the same env -> argparse -> consumer
+    route without needing a gate, so the number of hops is not what marks
+    this one out: its last hop lands somewhere version-specific, and
+    which SDK is installed decides where the value has to go.
+
+    1.x reads ``mcp.settings``; 2.0 takes run() kwargs but still has a
+    ``settings`` object, so a
+    ``settings is not None`` test picks the 1.x path and then dies on
+    ``ValueError: "Settings" object has no field "host"`` — startup, not
+    just the knob.
+
+    Asserts the value is observable wherever this SDK actually reads it,
+    rather than that the assignment happened.
+    """
+    import server
+
+    host, port = "10.1.2.3", 19999
+    run_kwargs = server._apply_bind_address(host, port)
+
+    settings = getattr(server.mcp, "settings", None)
+    if settings is not None and hasattr(settings, "host"):  # mcp 1.x
+        assert (settings.host, settings.port) == (host, port)
+        assert run_kwargs == {}
+    else:  # mcp 2.0+
+        assert run_kwargs == {"host": host, "port": port}
