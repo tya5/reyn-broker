@@ -13,9 +13,17 @@ notification can say *why* the session is idle when that info exists.
 
 Runs as a broker-managed plugin (auto_start=True recommended).
 
+Notification recipients
+------------------------
+Recipients are whoever has called ``subscribe_plugin_notifications(plugin=
+"peer-idle-notifier", session_id=...)`` on the broker — self-service, no
+maintainer/restart needed to add or drop a recipient (reyn-broker#26).
+``PEER_IDLE_NOTIFY`` is now only a fallback used when nobody has opted in.
+
 Environment variables
 ---------------------
-PEER_IDLE_NOTIFY     Target session for notifications (default: backlog-watcher)
+PEER_IDLE_NOTIFY     Fallback target used only while the subscriber list is
+                     empty (default: backlog-watcher).
 PEER_IDLE_WATCH      Comma-separated session ids to monitor.
                      If unset, all sessions except broker and self are watched.
 """
@@ -64,8 +72,12 @@ class PeerIdleNotifier(BrokerPlugin):
             text = f"PEER_IDLE: {sid} is ready for new work"
             if status:
                 text += f" (status={status}" + (f": {detail}" if detail else "") + ")"
-            await broker.post(to=_NOTIFY_TARGET, message=text)
-            logger.info("%s", text)
+            targets = await broker.notification_subscribers()
+            if not targets:
+                targets = [_NOTIFY_TARGET]
+            for target in targets:
+                await broker.post(to=target, message=text)
+            logger.info("%s -> %s", text, targets)
 
 
 def main() -> None:

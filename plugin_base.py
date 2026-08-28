@@ -225,6 +225,19 @@ class BrokerClient:
         result = await self._cs.call_tool("list_sessions", {"compact": compact})
         return _parse_result(result) or []
 
+    async def notification_subscribers(self, plugin: str | None = None) -> list[str]:
+        """Return session ids opted in to ``plugin``'s notifications.
+
+        ``plugin`` defaults to this plugin's own ``session_id``. Empty list
+        means nobody has opted in via ``subscribe_plugin_notifications`` yet
+        — decide what that means for you (e.g. an env-var fallback target).
+        """
+        result = await self._cs.call_tool(
+            "list_plugin_notification_subscribers",
+            {"plugin": plugin or self._session_id},
+        )
+        return _parse_result(result) or []
+
     async def peek(self, limit: int = 10) -> list[dict[str, Any]]:
         """Preview inbox messages without draining them."""
         result = await self._cs.call_tool(
