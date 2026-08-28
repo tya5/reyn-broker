@@ -1718,3 +1718,83 @@ def test_bind_address_knob_reaches_the_sdk() -> None:
         assert run_kwargs == {}
     else:  # mcp 2.0+
         assert run_kwargs == {"host": host, "port": port}
+
+
+@pytest.mark.asyncio
+async def test_plugin_notifications_subscribe_list_unsubscribe(broker_url: str) -> None:
+    """subscribe/list/unsubscribe round-trips and is idempotent (reyn-broker#26).
+
+    Pins the failure mode #26 filed: a plugin's recipient list must be
+    something any session can change itself, not a hardcoded single target
+    requiring a maintainer edit + restart to alter.
+    """
+    async with _client(broker_url) as c:
+        assert _payload(await c.call_tool(
+            "list_plugin_notification_subscribers", {"plugin": "peer-idle-notifier"}
+        )) == []
+
+        await c.call_tool("subscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "lead-coder",
+        })
+        # idempotent: subscribing again does not duplicate
+        await c.call_tool("subscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "lead-coder",
+        })
+        await c.call_tool("subscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "architect",
+        })
+        subs = _payload(await c.call_tool(
+            "list_plugin_notification_subscribers", {"plugin": "peer-idle-notifier"}
+        ))
+        assert subs == ["lead-coder", "architect"]
+
+        await c.call_tool("unsubscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "lead-coder",
+        })
+        subs = _payload(await c.call_tool(
+            "list_plugin_notification_subscribers", {"plugin": "peer-idle-notifier"}
+        ))
+        assert subs == ["architect"]
+
+        # unsubscribing a non-subscriber is a no-op, not an error
+        result = await c.call_tool("unsubscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "nobody",
+        })
+        assert "not subscribed" in _payload(result)
+
+
+@pytest.mark.asyncio
+async def test_plugin_notifications_are_namespaced_per_plugin(broker_url: str) -> None:
+    """Two plugins' subscriber lists never bleed into each other."""
+    async with _client(broker_url) as c:
+        await c.call_tool("subscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "lead-coder",
+        })
+        await c.call_tool("subscribe_plugin_notifications", {
+            "plugin": "github-ci-watcher", "session_id": "architect",
+        })
+        idle_subs = _payload(await c.call_tool(
+            "list_plugin_notification_subscribers", {"plugin": "peer-idle-notifier"}
+        ))
+        ci_subs = _payload(await c.call_tool(
+            "list_plugin_notification_subscribers", {"plugin": "github-ci-watcher"}
+        ))
+    assert idle_subs == ["lead-coder"]
+    assert ci_subs == ["architect"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_notifications_persist_across_restart(broker_restart) -> None:
+    """The subscriber list survives a broker restart, like other state."""
+    url = broker_restart()
+    async with _client(url) as c:
+        await c.call_tool("subscribe_plugin_notifications", {
+            "plugin": "peer-idle-notifier", "session_id": "lead-coder",
+        })
+
+    url = broker_restart()
+    async with _client(url) as c:
+        subs = _payload(await c.call_tool(
+            "list_plugin_notification_subscribers", {"plugin": "peer-idle-notifier"}
+        ))
+    assert subs == ["lead-coder"]

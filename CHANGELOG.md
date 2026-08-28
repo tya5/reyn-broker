@@ -4,6 +4,18 @@ All notable changes to reyn-broker are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`subscribe_plugin_notifications` / `unsubscribe_plugin_notifications` /
+  `list_plugin_notification_subscribers`** (#26). A plugin with a single
+  hardcoded-env-var notification target (e.g. `peer-idle-notifier`'s
+  `PEER_IDLE_NOTIFY`) had no way for a session to opt in or out without a
+  maintainer editing the env var and restarting the plugin process — and
+  the "recipient" was silently whoever happened to be the coded default,
+  not an actual subscriber. These three tools give any plugin a persisted,
+  self-service, multi-recipient subscriber list instead. `peer-idle-notifier`
+  is the first plugin switched over; the env var is now only a fallback
+  used while the subscriber list is empty.
+
 ### Changed
 - **Runs on both mcp 1.x and 2.0** (#16). The SDK's 2.0 release renames or
   moves most of what the server touches, and the pieces fail at different

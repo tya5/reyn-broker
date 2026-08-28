@@ -87,6 +87,11 @@ plugins: dict[str, PluginEntry] = {}
 event_subscriptions: dict[str, list[EventSubscription]] = {}
 # session_id → list of command dicts ({name, description, args})
 plugin_commands: dict[str, list[dict[str, Any]]] = {}
+# plugin name → ordered list of session ids that opted in to that plugin's
+# notifications (e.g. "peer-idle-notifier" -> ["lead-coder", "architect"]).
+# A plugin with a single hardcoded env-var target can read this instead —
+# see subscribe_plugin_notifications / unsubscribe_plugin_notifications.
+plugin_notify_targets: dict[str, list[str]] = {}
 # session_id (parsed out of broker://inbox/<id>) → live ServerSessions that
 # subscribed to that inbox resource. Deliberately not persisted: a subscription
 # is a property of an open connection, so after a restart there is nothing to
@@ -538,6 +543,7 @@ def _save_state() -> None:
                 for subs in event_subscriptions.values()
                 for s in subs
             ],
+            "plugin_notify_targets": plugin_notify_targets,
         }
         tmp = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False))
@@ -587,12 +593,16 @@ def _load_state() -> None:
             event_types=set(sub.get("event_types", [])),
             session_filter=sub.get("session_filter"),
         ))
+    for plugin, targets in data.get("plugin_notify_targets", {}).items():
+        plugin_notify_targets[plugin] = list(targets)
     logger.info(
-        "restored state: %d sessions, %d queued messages, %d plugins, %d event subs",
+        "restored state: %d sessions, %d queued messages, %d plugins, %d event subs, "
+        "%d plugin notify lists",
         len(sessions),
         sum(len(v) for v in pending.values()),
         len(plugins),
         sum(len(v) for v in event_subscriptions.values()),
+        len(plugin_notify_targets),
     )
 
 
@@ -1376,6 +1386,68 @@ async def list_plugin_commands(session_id: str) -> list[dict[str, Any]]:
     """
     _tool_call_counts["list_plugin_commands"] += 1
     return plugin_commands.get(session_id, [])
+
+
+# ---------------------------------------------------------------------------
+# Plugin notification target subscriptions
+#
+# Fixes the single-hardcoded-recipient failure mode (reyn-broker#26): a
+# plugin like peer-idle-notifier used to read one fixed session id from an
+# env var, so changing "who gets notified" required a maintainer to edit
+# the env var and restart the plugin process. These three tools let any
+# session opt in/out of a named plugin's notifications directly, with the
+# list persisted like every other piece of broker state.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def subscribe_plugin_notifications(plugin: str, session_id: str) -> str:
+    """Add ``session_id`` to the notification recipients for ``plugin``.
+
+    ``plugin`` is the plugin's own name for this purpose (e.g.
+    ``"peer-idle-notifier"`` — see the plugin's own docs for what name it
+    reads). Idempotent: adding an already-subscribed session is a no-op.
+
+    Persisted; survives broker restarts. The plugin itself decides how to
+    read this list (typically via ``list_plugin_notification_subscribers``)
+    and what to do when it is empty — see the plugin's own docs.
+    """
+    _tool_call_counts["subscribe_plugin_notifications"] += 1
+    async with registry_lock:
+        targets = plugin_notify_targets.setdefault(plugin, [])
+        if session_id not in targets:
+            targets.append(session_id)
+            _save_state()
+    return f"'{session_id}' subscribed to '{plugin}' notifications"
+
+
+@mcp.tool()
+async def unsubscribe_plugin_notifications(plugin: str, session_id: str) -> str:
+    """Remove ``session_id`` from the notification recipients for ``plugin``.
+
+    A no-op (not an error) if not currently subscribed.
+    """
+    _tool_call_counts["unsubscribe_plugin_notifications"] += 1
+    async with registry_lock:
+        targets = plugin_notify_targets.get(plugin)
+        if not targets or session_id not in targets:
+            return f"'{session_id}' was not subscribed to '{plugin}' notifications"
+        targets.remove(session_id)
+        if not targets:
+            del plugin_notify_targets[plugin]
+        _save_state()
+    return f"'{session_id}' unsubscribed from '{plugin}' notifications"
+
+
+@mcp.tool()
+async def list_plugin_notification_subscribers(plugin: str) -> list[str]:
+    """Return the session ids currently subscribed to ``plugin``'s notifications.
+
+    Empty list means nobody has opted in yet — the plugin decides what that
+    means for it (e.g. fall back to a legacy env-var default).
+    """
+    _tool_call_counts["list_plugin_notification_subscribers"] += 1
+    return list(plugin_notify_targets.get(plugin, []))
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,9 @@ Use `lsof -ti:<port> -sTCP:LISTEN` if you need a port-based stop.
 | `start_plugin` / `stop_plugin` / `restart_plugin` / `remove_plugin` | `name` | Manage plugin lifecycle without broker restart. |
 | `list_plugins`       | *(none)*                                        | List registered plugins with running state and PID.                             |
 | `list_plugin_commands` | `session_id`                                  | Retrieve a plugin's declared command schema.                                    |
+| `subscribe_plugin_notifications` | `plugin`, `session_id`             | Opt in to a plugin's notifications (e.g. `peer-idle-notifier`) — self-service, no maintainer/restart needed. Idempotent, persisted. |
+| `unsubscribe_plugin_notifications` | `plugin`, `session_id`           | Opt out. No-op if not subscribed.                                               |
+| `list_plugin_notification_subscribers` | `plugin`                     | Current subscriber list for a plugin.                                          |
 | `health_check`      | *(none)*                                        | Returns `version`, `started_at_iso`, `uptime_seconds`, `session_count`, `total_pending`. |
 
 ### Resources — subscribing to an inbox
