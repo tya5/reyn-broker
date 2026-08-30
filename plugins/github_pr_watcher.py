@@ -50,8 +50,7 @@ PR_WATCH_FAST_STATES     Comma-separated mergeStateStatus values treated as
                          mid-flight (default: BLOCKED,UNKNOWN)
 REYN_REPO_PATH           Local path to a `tya5/reyn` checkout (any branch —
                          only `.git` is used) for the #5265 permanently-
-                         blocked check below (default:
-                         ~/Workspace/reyn_dev/e2e-coder).
+                         blocked check below. No default — see below.
 
 #5265 permanently-blocked detection
 ------------------------------------
@@ -73,6 +72,15 @@ currently-merged version regardless of what the checkout has locally
 staged. Fires a `pr_blocked_forever` event AT MOST ONCE per BLOCKED
 episode (re-arms once the PR leaves BLOCKED). No auto-recovery (architect
 ruling) — detection only.
+
+`REYN_REPO_PATH` has deliberately NO default (lead-coder review, reyn#29):
+an earlier draft defaulted to the plugin author's own session worktree —
+this plugin's own repo-genericity rule ("other watched repos are skipped,
+logged, not silently") applies to its own prerequisite too. Unset →
+skipped + logged on every check, exactly like an unsupported repo, never a
+guessed path that breaks the moment some unrelated session's own worktree
+moves or is deleted (this watcher has no way to notice — it runs in a
+DIFFERENT repo, a different session's filesystem).
 """
 from __future__ import annotations
 
@@ -103,9 +111,13 @@ _FAST_STATES = frozenset(
 # script does not actually support.
 _REYN_REPO = "tya5/reyn"
 _REYN_5265_SCRIPT_PATH = "scripts/detect_5265_startup_failure_blocked_prs.py"
-_REYN_REPO_PATH = os.path.expanduser(
-    os.environ.get("REYN_REPO_PATH", "~/Workspace/reyn_dev/e2e-coder")
-)
+# No default (lead-coder review, reyn#29) — see the module docstring's
+# `REYN_REPO_PATH` entry for why. `None` here means "skip the check",
+# handled explicitly in `_check_permanently_blocked` below, not by an
+# accidental path that happens not to exist.
+_REYN_REPO_PATH = os.environ.get("REYN_REPO_PATH")
+if _REYN_REPO_PATH:
+    _REYN_REPO_PATH = os.path.expanduser(_REYN_REPO_PATH)
 
 
 @dataclass
@@ -152,7 +164,17 @@ def _check_permanently_blocked(pr_number: int) -> str | None:
     the PR's checks will never report, else None (not blocked, or the
     check itself failed — fail silent, never crash the poller over a
     detector-side error; that failure would surface in the plugin's own
-    logs via the captured stderr below)."""
+    logs via the captured stderr below).
+
+    Skips (logged, not silently) when `REYN_REPO_PATH` is unset — no
+    default is guessed (lead-coder review, reyn#29)."""
+    if not _REYN_REPO_PATH:
+        logger.warning(
+            "#5265 detector skipped for PR #%d: REYN_REPO_PATH is unset "
+            "(set it to a local tya5/reyn checkout to enable this check)",
+            pr_number,
+        )
+        return None
     try:
         script_src = subprocess.run(
             ["git", "-C", _REYN_REPO_PATH, "show", f"origin/main:{_REYN_5265_SCRIPT_PATH}"],

@@ -122,3 +122,11 @@ async def test_blocked_forever_skipped_for_non_reyn_repo(monkeypatch):
     broker, check_calls = await _run_polls(monkeypatch, ["BLOCKED"], repo="other/repo")
     assert not [m for _, m in broker.posted if m.startswith("pr_blocked_forever:")]
     assert check_calls == 0, "the detector is tya5/reyn-only (its own hardcoded target)"
+
+
+def test_check_permanently_blocked_skips_when_repo_path_unset(monkeypatch):
+    # reyn#29 review (lead-coder): no guessed default for REYN_REPO_PATH —
+    # unset must skip cleanly (None), the same "skip + log, never guess"
+    # discipline this module already applies to non-tya5/reyn repos.
+    monkeypatch.setattr(pr_watcher, "_REYN_REPO_PATH", None)
+    assert pr_watcher._check_permanently_blocked(1) is None
