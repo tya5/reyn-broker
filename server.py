@@ -63,7 +63,7 @@ class SessionEntry:
     # (plugin processes, reyn-self coders) would otherwise be permanently
     # misread as "inside a turn". None is the correct answer for such a
     # session, not a defect to paper over.
-    active: "bool | None" = None
+    active: bool | None = None
     status: str | None = None               # semantic status (LLM-driven), e.g. "waiting"
     status_detail: str | None = None        # optional free-form status detail
 

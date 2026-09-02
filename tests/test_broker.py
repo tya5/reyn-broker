@@ -653,7 +653,7 @@ async def test_post_message_multi_recipient_return_format(broker_url: str) -> No
                     "to": "alice",
                     "from_session": "alice",
                     "message": "ping",
-                    "recipients": ["bob", "ghost"],  # bob registered (in_turn=unknown), ghost never registered
+                    "recipients": ["bob", "ghost"],  # bob=in_turn:unknown, ghost=never registered
                 },
             )
     text = result.content[0].text
@@ -1609,7 +1609,9 @@ async def test_restart_does_not_resurrect_active_to_true(broker_restart) -> None
     restart."""
     url = broker_restart()
     async with _client(url) as c:
-        await c.call_tool("register_session", {"session_id": "never-reported", "working_dir": "/tmp/n"})
+        await c.call_tool(
+            "register_session", {"session_id": "never-reported", "working_dir": "/tmp/n"},
+        )
 
     url = broker_restart()  # simulate broker restart — reload from disk
     async with _client(url) as c:
