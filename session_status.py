@@ -72,7 +72,7 @@ def main() -> None:
 
 
 def main_active() -> None:
-    """reyn-broker-active SESSION_ID true|false — set the mechanical liveness axis.
+    """reyn-broker-active SESSION_ID true|false — set the in-turn bit (#31).
 
     Intended for Claude Code hooks (zero LLM cost):
       work-start hook → reyn-broker-active <id> true

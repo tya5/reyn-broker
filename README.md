@@ -107,9 +107,9 @@ falling back to `recipients`'s default and broadcasting to everyone.
 | `receive_messages`  | `session_id`, `fields?`                         | Drain and return the caller's inbox. `fields=["from","message"]` strips metadata to reduce token overhead. |
 | `peek_messages`     | `session_id`, `limit?`, `fields?`              | Non-destructive content preview: returns up to `limit` (default 10) messages without draining. Supports `fields` selector. |
 | `inbox_stats`       | `session_id`                                    | Non-destructive peek: `{pending_count, senders}`.                              |
-| `set_active`        | `session_id`, `active`                          | Set the mechanical liveness bool (hook-driven, deterministic). Fires `active_changed` only on a real flip. The authoritative signal for stall/idle detection. Orthogonal to `update_session_status` — never clobbers `status`. |
+| `set_active`        | `session_id`, `active`                          | Set the in-turn bit (hook-driven, deterministic; `true`=inside a turn, `false`=at the prompt). Fires `active_changed` only on a real flip. The authoritative signal for stall/idle detection. Orthogonal to `update_session_status` — never clobbers `status`. |
 | `update_session_status` | `session_id`, `status`, `detail?`           | Report the semantic status (LLM-driven, e.g. `"waiting"` + reason). Fires `status_changed`. Enrichment only; never touches `active`. |
-| `get_session_status` | `session_id`                                   | Return `{registered, active, status, status_detail}` for one session. |
+| `get_session_status` | `session_id`                                   | Return `{registered, active, status, status_detail}` for one session. `active` is `null` when this session's hooks have never reported one. |
 | `subscribe_session_events` | `subscriber_id`, `event_types`, `session_filter?` | Push session lifecycle events (`registered`, `unregistered`, `posted`, `status_changed`) into the subscriber's inbox. |
 | `unsubscribe_session_events` | `subscriber_id`                          | Cancel an event subscription.                                                   |
 | `tool_stats`        | *(none)*                                        | Return per-tool call counts since broker start. Useful for token-cost analysis. |
@@ -159,10 +159,13 @@ peers can find you via `list_sessions` without relying on naming conventions.
 It is optional; sessions that omit it appear with `role: null`.
 
 `post_message` distinguishes a recipient that has never registered from one
-that is registered but idle: the former is reported as `NOT REGISTERED`
-rather than `online=False`. The message is queued either way (a session may
-legitimately register after mail is sent for it), but a typo'd or
-wrong-namespace id no longer looks like a peer who happens to be away.
+that is registered but not currently mid-turn: the former is reported as
+`NOT REGISTERED` rather than `in_turn=false`. The message is queued either
+way (a session may legitimately register after mail is sent for it), but a
+typo'd or wrong-namespace id no longer looks like a peer who happens to be
+away. `in_turn` itself is `true`/`false`/`unknown` — `unknown` for a
+recipient whose hooks have never reported one (#31/#30), never collapsed
+into `false`.
 
 `request_read_ack=True` on `post_message` makes the broker queue a
 `read-ack` notification (from `"broker"`) back to the sender's inbox the
