@@ -56,7 +56,14 @@ class SessionEntry:
     last_receive_at: str | None = None
     session_expires_at: float | None = None  # epoch timestamp; None = no TTL
     # Two orthogonal axes (see set_active / update_session_status):
-    active: bool = True                     # mechanical liveness (hook-driven); True = working
+    # in-turn bit (hook-reported): None = never reported, True = inside
+    # a turn, False = at the prompt. #31/#30 (architect ruling,
+    # 2026-09-02): the default must not manufacture a fact this session
+    # never reported — a session whose Claude Code hooks never run
+    # (plugin processes, reyn-self coders) would otherwise be permanently
+    # misread as "inside a turn". None is the correct answer for such a
+    # session, not a defect to paper over.
+    active: "bool | None" = None
     status: str | None = None               # semantic status (LLM-driven), e.g. "waiting"
     status_detail: str | None = None        # optional free-form status detail
 
@@ -625,7 +632,11 @@ def _load_state() -> None:
             last_post_at=entry.get("last_post_at"),
             last_receive_at=entry.get("last_receive_at"),
             session_expires_at=entry.get("session_expires_at"),
-            active=entry.get("active", True),
+            # #31: default must be None, not True — a restart must not
+            # manufacture "inside a turn" for a session that never
+            # reported one (the exact bug this PR fixes; a stray True
+            # default here would silently resurrect it every restart).
+            active=entry.get("active"),
             status=entry.get("status"),
             status_detail=entry.get("status_detail"),
         )
@@ -907,7 +918,12 @@ async def unregister_session(session_id: str) -> str:
 
 @mcp.tool()
 async def set_active(session_id: str, active: bool) -> str:
-    """Set a session's mechanical liveness flag (the DETERMINISTIC axis).
+    """Set a session's in-turn bit (the DETERMINISTIC axis) — #31/#30
+    (architect ruling): "mechanical liveness" is the wrong noun for this
+    axis (it is turn-state, not whether the process is alive), and this
+    call only ever reports a real True/False — the ``None`` ("never
+    reported") default lives on the dataclass field / restore path, not
+    here.
 
     This axis is meant to be driven by Claude Code hooks at zero LLM cost:
     - work-start hook (UserPromptSubmit / PreToolUse) → ``set_active(id, True)``
@@ -955,7 +971,7 @@ async def update_session_status(
 
     This is the LLM-driven axis describing *what* the session is doing or
     waiting for (e.g. ``"waiting"`` + ``detail="ci:#1268"``). It is orthogonal
-    to ``set_active`` (the mechanical liveness bool): this call never touches
+    to ``set_active`` (the in-turn bit): this call never touches
     ``active``, so it cannot be clobbered by a Stop hook's ``set_active(False)``.
 
     Monitors treat ``status`` as enrichment, not authority — stall/idle
@@ -1005,9 +1021,10 @@ async def get_session_status(session_id: str) -> dict[str, Any]:
     in delayed checks where in-memory state may be stale due to missed events.
 
     Returns a dict with ``session_id``, ``registered`` (bool), ``active``
-    (bool — the mechanical liveness axis), ``status`` and ``status_detail``
-    (the semantic axis). If the session is not registered, ``registered`` is
-    ``False`` and the other fields are ``None``.
+    (``bool | None`` — the in-turn axis; ``None`` = this session has never
+    reported one, #31), ``status`` and ``status_detail`` (the semantic
+    axis). If the session is not registered, ``registered`` is ``False``
+    and the other fields are ``None``.
     """
     _tool_call_counts["get_session_status"] += 1
     async with registry_lock:
@@ -1065,8 +1082,8 @@ async def post_message(
 
     **Multiple recipients**: pass ``recipients=[...]`` with a list of
     session ids. When ``recipients`` is provided it takes precedence over
-    ``to``; ``to`` is then ignored. Returns a summary of how many
-    recipients were online/offline.
+    ``to``; ``to`` is then ignored. Returns a summary of each recipient's
+    ``in_turn`` state (see below) — delivery itself never depends on it.
 
     ``request_read_ack=True`` makes the broker automatically queue a
     ``read-ack`` message back to ``from_session`` when *each* recipient
@@ -1094,15 +1111,26 @@ async def post_message(
     if ttl_seconds is not None:
         payload["_expires_at"] = time.time() + ttl_seconds
 
-    online: list[str] = []
-    offline: list[str] = []
+    # #31/#30 (architect ruling, 2026-09-02): three real values, never
+    # collapsed to two — ``unknown`` (a session whose hooks never
+    # reported an in-turn state) must not be folded into either
+    # true/false bucket, the exact two-facts-one-value bug this fixes.
+    in_turn_true: list[str] = []
+    in_turn_false: list[str] = []
+    in_turn_unknown: list[str] = []
     unregistered: list[str] = []
 
     async with registry_lock:
         for target in targets:
             pending[target].append(dict(payload))
             if target in sessions:
-                (online if sessions[target].active else offline).append(target)
+                _active = sessions[target].active
+                if _active is None:
+                    in_turn_unknown.append(target)
+                elif _active:
+                    in_turn_true.append(target)
+                else:
+                    in_turn_false.append(target)
             else:
                 # Queued, but nobody will ever drain it unless a session
                 # registers under this exact id. Reported separately so the
@@ -1118,7 +1146,7 @@ async def post_message(
         _push_session_event_locked("posted", from_session)
         _save_state()
 
-    for target in (*online, *offline):
+    for target in (*in_turn_true, *in_turn_false, *in_turn_unknown):
         push_payload = _strip_internal(payload)
         await _deliver(target, push_payload)
 
@@ -1135,11 +1163,18 @@ async def post_message(
                 f" registered this id; check the session_id, it is a different"
                 f" namespace from ListAgents names)"
             )
-        return f"queued for '{target}' (online={target in online})"
+        if target in in_turn_true:
+            _in_turn = "true"
+        elif target in in_turn_false:
+            _in_turn = "false"
+        else:
+            _in_turn = "unknown"
+        return f"queued for '{target}' (in_turn={_in_turn})"
     parts = [
         f"queued for {len(targets)} recipients",
-        f" (online: {', '.join(online) or 'none'}",
-        f"; offline: {', '.join(offline) or 'none'}",
+        f" (in_turn=true: {', '.join(in_turn_true) or 'none'}",
+        f"; in_turn=false: {', '.join(in_turn_false) or 'none'}",
+        f"; in_turn=unknown: {', '.join(in_turn_unknown) or 'none'}",
     ]
     if unregistered:
         parts.append(f"; NOT REGISTERED: {', '.join(unregistered)}")
@@ -1549,10 +1584,12 @@ async def subscribe_session_events(
     - ``"status_changed"`` — a session called ``update_session_status``
       with a new value (semantic axis). Payload carries ``status``,
       ``detail``, and ``prev_status``.
-    - ``"active_changed"`` — a session's mechanical liveness bool flipped
-      via ``set_active``. Payload carries ``active``, ``prev_active``, and
-      the current ``status`` / ``detail`` for enrichment. This is the
-      authoritative edge for stall/idle detection (active False = idle).
+    - ``"active_changed"`` — a session's in-turn bit flipped via
+      ``set_active`` (only ever a real True/False transition — a session
+      that never reports stays ``None`` and never fires this edge, #31).
+      Payload carries ``active``, ``prev_active``, and the current
+      ``status`` / ``detail`` for enrichment. This is the authoritative
+      edge for stall/idle detection (active False = idle).
 
     ``session_filter`` — optional list of session ids to watch. ``None``
     (default) means watch all sessions.

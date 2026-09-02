@@ -147,10 +147,12 @@ post_message(
     from_session="<自分の session_id>",
     message="<本文>"
 )
-→ "queued for '<相手>' (online=true|false)"
+→ "queued for '<相手>' (in_turn=true|false|unknown)"
 ```
 
-- メッセージは常に相手の inbox にキューされる(相手のオン/オフ問わず)
+- `in_turn` は相手が今 turn の中か(Stop hook で false)。報告が無い session は
+  `unknown`。到達性は `get_session_status().registered`、配送はこの値に依らない(#31/#30)
+- メッセージは常に相手の inbox にキューされる(`in_turn` の値に関わらず)
 - 相手は自分で `receive_messages` を呼んで取り出す
 - 返信を期待する場合は、メッセージ本文に「終わったら post_message で
   `<自分の session_id>` に返してください」と明示する
@@ -226,6 +228,15 @@ session 自身だけ**。だから status の自己申告は「便利」では�
 両者は独立フィールド。`set_active(false)` は status に触れず、`update_session_status`
 は active に触れない。だから Stop hook の機械的 idle が LLM の `waiting` 申告を
 **clobber しない**。
+
+**`active` は3値**（#31、2026-09-02 architect 裁定）: `None` = 一度も報告されて
+いない、`true`/`false` = 最後に報告された値。plugin process や reyn-self の
+coder のように Claude Code hook を走らせない session は `active: null` の
+まま — これは欠陥ではなく「この軸が使えない」という正しい答え。`None` は
+遷移を生まないので `active_changed`（下記）は一度も発火しない = そのような
+session は stall/idle 通知の対象に構造上なり得ない（除外リストは不要）。
+`null` を `false` に読み替えないこと — 読み替えた瞬間「一度も報告していない」
+と「今 turn の外にいる」の二義が戻る。
 
 ### active は両エッジを撃つ義務（hook）
 

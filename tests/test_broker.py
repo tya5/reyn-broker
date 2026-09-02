@@ -185,9 +185,9 @@ async def test_post_to_offline_recipient_queues(broker_url: str) -> None:
     text = result.content[0].text
     assert "bob" in text
     # bob has never registered, so the reply must say that rather than
-    # "online=False" — an unknown id and an idle peer used to be reported
-    # identically, which is what reyn-broker#14 fixed. The message is still
-    # queued either way (asserted by the pending-drain test below).
+    # "in_turn=false" — an unknown id and a not-mid-turn peer used to be
+    # reported identically, which is what reyn-broker#14 fixed. The message
+    # is still queued either way (asserted by the pending-drain test below).
     assert "NOT REGISTERED" in text
 
 
@@ -653,7 +653,7 @@ async def test_post_message_multi_recipient_return_format(broker_url: str) -> No
                     "to": "alice",
                     "from_session": "alice",
                     "message": "ping",
-                    "recipients": ["bob", "ghost"],  # bob online, ghost offline
+                    "recipients": ["bob", "ghost"],  # bob registered (in_turn=unknown), ghost never registered
                 },
             )
     text = result.content[0].text
@@ -667,7 +667,7 @@ async def test_post_message_single_recipient_backward_compat(broker_url: str) ->
     """recipients=None → original to= behaviour preserved."""
     async with _client(broker_url) as a:
         await a.call_tool("register_session", {"session_id": "alice", "working_dir": "/tmp/a"})
-        # bob is registered so the reply exercises the online= form; an
+        # bob is registered so the reply exercises the in_turn= form; an
         # unregistered target takes the reyn-broker#14 branch instead, which
         # would make this assert about recipient existence rather than about
         # the single- vs multi-recipient reply format it is here to pin.
@@ -681,7 +681,7 @@ async def test_post_message_single_recipient_backward_compat(broker_url: str) ->
             )
     text = result.content[0].text
     assert "bob" in text
-    assert "online=" in text  # original single-recipient format
+    assert "in_turn=" in text  # original single-recipient format (renamed from online=, #31/#30)
     assert "recipients" not in text  # not the aggregated multi-recipient form
 
 
@@ -757,7 +757,9 @@ async def test_list_sessions_compact_returns_only_id_and_role(broker_url: str) -
             {"session_id": "alice", "working_dir": "/tmp/a", "role": "tester"},
         )
         result = _payload(await a.call_tool("list_sessions", {"compact": True}))
-    assert result == [{"session_id": "alice", "role": "tester", "active": True, "status": None}]
+    # #31: active defaults to None (never reported), not True — register_session
+    # alone never calls set_active.
+    assert result == [{"session_id": "alice", "role": "tester", "active": None, "status": None}]
 
 
 @pytest.mark.asyncio
@@ -1482,7 +1484,7 @@ async def test_status_changed_carries_prev_status(broker_url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# set_active — mechanical liveness axis, orthogonal to status
+# set_active — the in-turn bit (#31), orthogonal to status
 # ---------------------------------------------------------------------------
 
 
@@ -1495,7 +1497,7 @@ async def test_set_active_does_not_clobber_status(broker_url: str) -> None:
         await c.call_tool("update_session_status", {
             "session_id": "x", "status": "waiting", "detail": "ci:#1268",
         })
-        # Stop hook flips mechanical liveness
+        # Stop hook flips the in-turn bit
         await c.call_tool("set_active", {"session_id": "x", "active": False})
         st = _payload(await c.call_tool("get_session_status", {"session_id": "x"}))
     assert st["active"] is False
@@ -1531,9 +1533,88 @@ async def test_active_changed_event_carries_status_enrichment(broker_url: str) -
                 if m.get("event") == "active_changed"]
     assert len(msgs) == 1
     assert msgs[0]["active"] is False
-    assert msgs[0]["prev_active"] is True
+    # #31: A never called set_active before this — active defaults to
+    # None (never reported), not True, so THIS is the None→False edge.
+    assert msgs[0]["prev_active"] is None
     assert msgs[0]["status"] == "waiting"   # enrichment carried on the event
     assert msgs[0]["detail"] == "ci:#1"
+
+
+# ---------------------------------------------------------------------------
+# #31 (architect ruling, 2026-09-02): active is None until a session's hooks
+# report a real value — accept/deny/deny-sibling from the ruling's own
+# accept criteria (reviewer strip: revert the two `True` defaults at
+# server.py's dataclass field and its restore path; both deny tests below
+# must then go red).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_active_defaults_to_none_then_reports_via_hooks(broker_url: str) -> None:
+    """Tier accept: a freshly-registered session is active=None (never
+    reported) — not True. work-start (set_active True) and Stop (set_active
+    False) each report a real value in turn."""
+    async with _client(broker_url) as c:
+        await c.call_tool("register_session", {"session_id": "x", "working_dir": "/tmp/x"})
+        st = _payload(await c.call_tool("get_session_status", {"session_id": "x"}))
+        assert st["active"] is None
+
+        await c.call_tool("set_active", {"session_id": "x", "active": True})
+        st = _payload(await c.call_tool("get_session_status", {"session_id": "x"}))
+        assert st["active"] is True
+
+        await c.call_tool("set_active", {"session_id": "x", "active": False})
+        st = _payload(await c.call_tool("get_session_status", {"session_id": "x"}))
+        assert st["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_never_reports_never_fires_active_changed(broker_url: str) -> None:
+    """Tier deny: a session whose hooks never call set_active stays active=None
+    forever — no active_changed event ever fires for it (peer-idle-notifier's
+    own consumer checks ``active is False`` specifically, so this session is
+    structurally never notified about, however long it is left alone)."""
+    async with _client(broker_url) as s, _client(broker_url) as a:
+        await s.call_tool("register_session", {"session_id": "sub", "working_dir": "/tmp/s"})
+        await a.call_tool("register_session", {"session_id": "ghosted", "working_dir": "/tmp/a"})
+        await s.call_tool("subscribe_session_events", {
+            "subscriber_id": "sub", "event_types": ["active_changed"],
+            "session_filter": ["ghosted"],
+        })
+        # Other, unrelated broker activity happens — but "ghosted" itself
+        # never calls set_active in either direction.
+        await a.call_tool("update_session_status", {
+            "session_id": "ghosted", "status": "waiting",
+        })
+        await a.call_tool("post_message", {
+            "to": "sub", "from_session": "ghosted", "message": "hi",
+        })
+        msgs = [m for m in _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
+                if m.get("event") == "active_changed"]
+        st = _payload(await a.call_tool("get_session_status", {"session_id": "ghosted"}))
+    assert msgs == [], (
+        f"a session that never calls set_active must never fire "
+        f"active_changed, got {msgs!r}"
+    )
+    assert st["active"] is None, "must stay None, never silently collapsed to False"
+
+
+@pytest.mark.asyncio
+async def test_restart_does_not_resurrect_active_to_true(broker_restart) -> None:
+    """Tier deny-sibling: a session that never reported active before a
+    broker restart must still read active=None afterwards — not True. This
+    is what the restore-path default (server.py's SessionEntry restore, not
+    just the dataclass field) actually guards; a stray `True` fallback
+    there would silently resurrect the exact bug #31 fixes on every
+    restart."""
+    url = broker_restart()
+    async with _client(url) as c:
+        await c.call_tool("register_session", {"session_id": "never-reported", "working_dir": "/tmp/n"})
+
+    url = broker_restart()  # simulate broker restart — reload from disk
+    async with _client(url) as c:
+        st = _payload(await c.call_tool("get_session_status", {"session_id": "never-reported"}))
+    assert st["active"] is None
 
 
 @pytest.mark.asyncio
@@ -1545,8 +1626,11 @@ async def test_set_active_noop_when_unchanged(broker_url: str) -> None:
         await s.call_tool("subscribe_session_events", {
             "subscriber_id": "sub", "event_types": ["active_changed"], "session_filter": ["A"],
         })
+        # #31: A registers with active=None by default now (never True) — the
+        # FIRST set_active(True) is a real None→True flip and fires an event;
+        # drain it before testing the actual no-op (True→True, unchanged).
+        await a.call_tool("set_active", {"session_id": "A", "active": True})
         await s.call_tool("receive_messages", {"session_id": "sub"})
-        # A registered active=True by default; set_active(True) is a no-op
         await a.call_tool("set_active", {"session_id": "A", "active": True})
         msgs = [m for m in _payload(await s.call_tool("receive_messages", {"session_id": "sub"}))
                 if m.get("event") == "active_changed"]

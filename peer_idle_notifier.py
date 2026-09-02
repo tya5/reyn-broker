@@ -2,9 +2,12 @@
 """Peer idle notifier plugin for reyn-broker.
 
 Subscribes to ``active_changed`` events and immediately notifies
-PEER_IDLE_NOTIFY when a monitored session goes idle (its mechanical liveness
-bool flips to False — typically driven by the session's Stop hook calling
-``set_active(id, False)``).
+PEER_IDLE_NOTIFY when a monitored session goes idle (its in-turn bit flips
+to False — typically driven by the session's Stop hook calling
+``set_active(id, False)``). #31: a session whose hooks never report (so
+``active`` stays ``None``, never True/False) never fires this event at
+all — structurally out of reach here, not something this plugin needs to
+filter for.
 
 The ``active`` bool is the *authoritative* idle signal (deterministic,
 hook-driven). The session's semantic ``status`` / ``detail`` (e.g. "waiting"
