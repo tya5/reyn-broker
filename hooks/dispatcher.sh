@@ -32,8 +32,17 @@
 # zero-element array even after `arr=()` -- a real bug, not a style choice.
 # None of the existing hooks/*.sh use `set -u` either; matching that.
 
-hooks_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-self_path="$hooks_dir/$(basename "${BASH_SOURCE[0]}")"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+self_path="$script_dir/$(basename "${BASH_SOURCE[0]}")"
+
+# hooks_dir is normally this script's own directory. DISPATCHER_HOOKS_DIR
+# overrides it -- ONLY for tests/test_dispatcher_dispatch.py, which needs a
+# dispatch_table.json + scripts it controls (a real-payload fixture cannot
+# assert byte-identity of stdin fan-out without a script written to record
+# exactly what it received). self_path is deliberately NOT affected by this
+# override -- the foreign-registration warn must keep comparing against the
+# REAL dispatcher.sh path regardless of where its hooks_dir points.
+hooks_dir="${DISPATCHER_HOOKS_DIR:-$script_dir}"
 table_file="$hooks_dir/dispatch_table.json"
 
 event="${1:-}"
