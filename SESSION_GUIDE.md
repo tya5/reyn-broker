@@ -24,6 +24,12 @@
   }
   ```
 - 未登録なら、上記を追加して Claude Code を再起動してから本手順を実行する
+- `~/Workspace/reyn_dev/` 全体に効く Claude Code hook（session_watcher / broker /
+  coder の working discipline を符号化したもの）の**正典はこの repo の `hooks/`**
+  （[#34](https://github.com/tya5/reyn-broker/issues/34)）。`~/.claude/settings.json`
+  への登録は `hooks/dispatcher.sh` の 1 本のみで、個々の hook は
+  `hooks/dispatch_table.json` 経由で呼び分けられる。**新しい hook を追加/変更する
+  ときは必ずこの repo を通すこと**（詳細: `hooks/README.md`）
 
 ---
 

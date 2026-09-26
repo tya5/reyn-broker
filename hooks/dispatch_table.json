@@ -1,0 +1,33 @@
+{
+  "_comment": "Typed envelope for hooks/dispatcher.sh. Keys are Claude Code hook event names. Each entry's tool_pattern is an ERE matched against the invocation's .tool_name (null = matches unconditionally, used for Stop which has no matcher). scripts are hooks/*.sh basenames, run in listed order, each fed the SAME stdin the dispatcher received. tests/test_hooks_dispatch_reachable.py asserts every hooks/*.sh file (other than dispatcher.sh itself) appears in some scripts[] here -- that is the CI gate for '11th hook wired outside the table'.",
+  "PreToolUse": [
+    {
+      "tool_pattern": "^Bash$",
+      "scripts": ["swe_bench_v_advance_gate.sh", "single_benchmark_dispatch_guard.sh"]
+    },
+    {
+      "tool_pattern": "^(Write|Edit)$",
+      "scripts": ["llm_speculation_block.sh", "memory_description_200char_check.sh"]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "tool_pattern": "^Bash$",
+      "scripts": ["merge_broker_reminder.sh"]
+    },
+    {
+      "tool_pattern": "^Write$",
+      "scripts": ["bootstrap_deploy_checklist.sh", "agent_activation_reminder.sh"]
+    },
+    {
+      "tool_pattern": "^(Write|Edit)$",
+      "scripts": ["verify_state_giveup_reminder.sh"]
+    }
+  ],
+  "Stop": [
+    {
+      "tool_pattern": null,
+      "scripts": ["background_dispatch_parallel_work_gate.sh", "no_permission_seeking_stop_gate.sh"]
+    }
+  ]
+}
