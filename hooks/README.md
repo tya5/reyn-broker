@@ -6,6 +6,56 @@ sessions). It replaces the prior state, where these 10 scripts lived only in
 `~/.claude/hooks/` and each sourced a separately-copied scope guard.
 Background: [issue #34](https://github.com/tya5/reyn-broker/issues/34).
 
+## Execution is the installed copy, never this checkout
+
+⚠️ **This directory is never registered in `~/.claude/settings.json` and
+`dispatcher.sh` here is never what actually runs.** Three separate things,
+kept separate on purpose (architect ruling, #34 follow-up):
+
+| | what it is | where |
+|---|---|---|
+| **Canon** | source of truth you edit and review | this repo's `hooks/` |
+| **Installed copy** | what every hook event actually invokes | `~/.claude/hooks/` |
+| **Update** | one command, run by a human, never automatic | `scripts/install_hooks.sh` |
+
+Why a copy at all: the moment `~/.claude/settings.json`'s `command` points
+inside a repo checkout, that working tree becomes a runtime dependency of
+every reyn_dev session — `git checkout` is a routine operation on this repo,
+not a rare accident, and it was measured (issue #34) that Claude Code does
+not report anything when a registered hook command does not exist: `rc=0`,
+turn completes normally, no warning anywhere. A missing dispatcher is
+invisible by construction, so the fix removes the working tree from the
+command's resolution path entirely, rather than adding a watchdog for when
+it breaks. Run `scripts/install_hooks.sh` to refresh `~/.claude/hooks/` from
+this repo after any change here (idempotent — running it twice with no repo
+changes is a no-op).
+
+### `~/.claude/hooks/` also holds hooks this repo does not own
+
+⚠️ **`~/.claude/hooks/` is not exclusively this repo's territory.** Project
+`.claude/settings.json` files (lead-coder / architect / e2e-coder /
+tui-coder) register their own hooks there too — at minimum
+`block_wide_pytest.sh`, `invalidate_stop_decision.sh`,
+`what_are_you_waiting_for.sh` — plus other files that predate this repo
+(`did_the_requester_get_it.py`, `merge_broker_reminder.sh.bak-5269`) and this
+very README once it is installed there. `scripts/install_hooks.sh` copies
+in an explicit **allowlist** — every `hooks/*.sh` plus `dispatch_table.json`
+— and never deletes or touches anything else in that directory. It never
+wipes the directory first; see `tests/test_install_hooks.py`.
+
+### Drift warn
+
+`dispatcher.sh`, at hook-run time, compares the installed copy's version
+stamp (`~/.claude/hooks/.hooks_version`, written by
+`scripts/install_hooks.sh`) against this repo's current content hash
+(`scripts/hooks_version.sh`, read from wherever `REYN_BROKER_REPO_DIR`
+points, default `$REYN_DEV_ROOT/broker`) and **warns to stderr — never
+blocks** — on a mismatch. Same "once per session" cadence as the
+foreign-registration warn below (same code path, not a separate mechanism).
+Silent if the repo is not present on disk at all — there is nothing to
+compare against, and no reason to nag someone who installed the hooks and
+deleted the checkout.
+
 ## Why this repo, and not `reyn` or the checkouts themselves
 
 - **Not the `reyn` repo**: these hooks encode *our* working discipline, not a
@@ -96,6 +146,9 @@ proof, since that rc is identical on both sides of the guard.
 1. Add the script to `hooks/`.
 2. Add it to `dispatch_table.json` under the right event + `tool_pattern`.
 3. `pytest tests/test_hooks_dispatch_reachable.py` — CI fails if you skip step 2.
+4. Run `scripts/install_hooks.sh` to refresh `~/.claude/hooks/` — the new
+   hook does nothing until the installed copy is updated (see "Execution is
+   the installed copy" above).
 
 There is no step where you touch `~/.claude/settings.json` — that file
 registers `dispatcher.sh` once per event and never changes when hooks are

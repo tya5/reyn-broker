@@ -89,17 +89,54 @@ esac
 settings_file="$HOME/.claude/settings.json"
 session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null || echo unknown)"
 warn_marker="${TMPDIR:-/tmp}/reyn-broker-dispatcher-warned-${session_id}"
-if [ -r "$settings_file" ] && [ ! -e "$warn_marker" ]; then
-  foreign="$(jq -r '[.hooks[][]?.hooks[]?.command] | .[]' "$settings_file" 2>/dev/null \
-    | awk '{print $1}' | sort -u | grep -vF -- "$self_path" || true)"
+if [ ! -e "$warn_marker" ]; then
   : > "$warn_marker" 2>/dev/null || true
-  if [ -n "$foreign" ]; then
-    {
-      echo "[dispatcher] WARN: ~/.claude/settings.json registers command(s) other than this dispatcher:"
-      printf '  %s\n' "$foreign"
-      echo "  Hooks must be registered by routing through tya5/reyn-broker's hooks/dispatcher.sh (issue #34)."
-      echo "  This warns only -- it does not block -- and it cannot detect a script that impersonates the dispatcher (see hooks/README.md)."
-    } >&2
+
+  if [ -r "$settings_file" ]; then
+    foreign="$(jq -r '[.hooks[][]?.hooks[]?.command] | .[]' "$settings_file" 2>/dev/null \
+      | awk '{print $1}' | sort -u | grep -vF -- "$self_path" || true)"
+    if [ -n "$foreign" ]; then
+      {
+        echo "[dispatcher] WARN: ~/.claude/settings.json registers command(s) other than this dispatcher:"
+        printf '  %s\n' "$foreign"
+        echo "  Hooks must be registered by routing through tya5/reyn-broker's hooks/dispatcher.sh (issue #34)."
+        echo "  This warns only -- it does not block -- and it cannot detect a script that impersonates the dispatcher (see hooks/README.md)."
+      } >&2
+    fi
+  fi
+
+  # ---------------------------------------------------------------------
+  # Drift warn (architect ruling, #34 follow-up -- "installed copy vs
+  # working tree"): dispatcher.sh always RUNS the installed copy in
+  # hooks_dir, never a repo checkout (see hooks/README.md). If the repo
+  # this copy was installed FROM is still present on disk, compare the
+  # installed copy's version stamp (written by scripts/install_hooks.sh)
+  # against the repo's CURRENT content hash (scripts/hooks_version.sh,
+  # read from the repo itself so the two never hash differently). A
+  # mismatch means install_hooks.sh has not been re-run since the repo
+  # changed -- e.g. a `git checkout`. Same "once per session" cadence as
+  # the foreign-registration warn above; this is the SAME warn mechanism,
+  # not a new one -- it just adds a second condition it can fire on.
+  #
+  # NEVER blocks: the repo may legitimately be mid-branch, and the
+  # installed copy is what actually runs regardless of what the repo says.
+  # Silent (no warn, no error) when the repo is absent -- there is no
+  # reason to nag someone who installed the hooks and then deleted the
+  # checkout.
+  # ---------------------------------------------------------------------
+  repo_dir="${REYN_BROKER_REPO_DIR:-$reyn_dev_root/broker}"
+  version_script="$repo_dir/scripts/hooks_version.sh"
+  installed_version_file="$hooks_dir/.hooks_version"
+  if [ -x "$version_script" ] && [ -d "$repo_dir/hooks" ] && [ -r "$installed_version_file" ]; then
+    repo_version="$("$version_script" "$repo_dir/hooks" 2>/dev/null || true)"
+    installed_version="$(cat "$installed_version_file" 2>/dev/null || true)"
+    if [ -n "$repo_version" ] && [ -n "$installed_version" ] && [ "$repo_version" != "$installed_version" ]; then
+      {
+        echo "[dispatcher] WARN: installed hooks copy ($hooks_dir) is out of date vs repo ($repo_dir)."
+        echo "  Run $repo_dir/scripts/install_hooks.sh to refresh it. This warns only -- it never blocks,"
+        echo "  and it does not change which copy runs (always the installed one, never the repo checkout)."
+      } >&2
+    fi
   fi
 fi
 
