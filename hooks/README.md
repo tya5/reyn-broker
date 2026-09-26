@@ -46,16 +46,15 @@ hook that skips the guard: every hook now reaches the machine only by being
 listed in `dispatch_table.json`, which `dispatcher.sh` always guards before
 consulting.
 
-## Two known-unconfirmed hooks — do not read their presence as "verified alive"
+## All 10 hooks are live — none are special-cased
 
 `swe_bench_v_advance_gate.sh`, `single_benchmark_dispatch_guard.sh`, and
-`verify_state_giveup_reminder.sh` are **carried forward with unconfirmed
-liveness** — owner has been asked whether the swe_bench workflow they gate is
-still in use. They are wired into `dispatch_table.json` exactly as before
-(carrying means keeping them reachable, not orphaning them) so removing them
-later is a real decision, not a silent gap. **If the owner confirms they are
-dead, the correct fix is to DELETE them** (script + dispatch_table.json
-entry), not to add another guard around them.
+`verify_state_giveup_reminder.sh` guard the discipline around
+`scripts/swe_bench_runner.py` (the shipped SWE-bench integration, entry point
+for users at `docs/guide/for-reyn-developers/run-swe-bench.md`, design in the
+ratified `docs/deep-dives/proposals/0008-swe-bench-integration.md`). They are
+wired into `dispatch_table.json` on the same footing as the other 7 hooks —
+no unconfirmed-liveness caveat, no separate removal path.
 
 ## What the foreign-registration warn does and does NOT catch
 
